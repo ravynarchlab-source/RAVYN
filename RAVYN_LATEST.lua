@@ -1,4 +1,4 @@
--- RAVYN v3.8.5 LOCAL MODULAR LOADER · GAME KNOWLEDGE + LEARN ACTION
+-- RAVYN DIRECT v1.2 EXPLOIT CORE · SLAYERS 2 · DIRECT RELEASE (built on v1.0.1 Premium UI)
 -- Each subsystem compiles in its own Luau chunk to stay below Xeno/Luau local-register limits.
 local G=(getgenv and getgenv()) or _G
 G.__RAVYN_CTX={Hooks={}}
@@ -401,7 +401,7 @@ Config.Default.Quest={Enabled=false,AutoLevel=true,Repeat=true,Highlight=false,H
 Config.Default.Loot={Chest=false,Drop=false,Soul=false,MaxDistance=80,Cooldown=2,Whitelist={},Blacklist={},RareFirst=true}
 Config.Default.Combat={AutoAttack=true,AutoAbilities=true,AutoEquip=false,Weapon="",AttackCooldown=0.5,AttackDistance=10,SkillDelay=1.35}
 Config.Default.Parry={Enabled=false,ReactionWindow=0.25,Cooldown=1}
-Config.Default.Movement={SpeedEnabled=false,Speed=16,MinSpeed=8,MaxSpeed=32,TravelMode="Tween",TweenSpeed=150}
+Config.Default.Movement={SpeedEnabled=false,Speed=16,MinSpeed=8,MaxSpeed=32,TravelMode="Teleport",TweenSpeed=150}
 Config.Default.Teleports={NPC=false,Training=false,Schematic=false,FrozenYeti=false,SelectedNPC="",SelectedTrainer="",SelectedSchematic="",Cooldown=5}
 Config.Default.Training={Enabled=false,Selected=""}
 Config.Default.Muzan={Enabled=false,Repeat=true,Track=false,Notify=true,Marker=false,RoamingTrack=false}
@@ -2204,6 +2204,7 @@ Config.Default.SmartCombat={
     LowHealthPercent=30,
     CriticalHealthPercent=20,
     RecoveryPercent=42,
+    HealthSafetyEscape=false, -- OFF = never climb/retreat just because player HP dropped
     OrbitInterval=1.15,
     AdaptiveTravel=true,
     AutoFaceTarget=true,
@@ -2231,6 +2232,7 @@ function Config.validate(c)
         if finite(s.CriticalHealthPercent) and finite(s.LowHealthPercent) and s.CriticalHealthPercent>s.LowHealthPercent then table.insert(errors,"SmartCombat health thresholds") end
         if finite(s.LowHealthPercent) and finite(s.RecoveryPercent) and s.RecoveryPercent<s.LowHealthPercent then table.insert(errors,"SmartCombat.RecoveryPercent") end
         if finite(s.RecoveryPercent) and s.RecoveryPercent>100 then table.insert(errors,"SmartCombat.RecoveryPercent") end
+        if type(s.HealthSafetyEscape)~="boolean" then table.insert(errors,"SmartCombat.HealthSafetyEscape") end
     end
     return #errors==0,errors
 end
@@ -2281,9 +2283,16 @@ local function healthPercent()
     return 100
 end
 
+-- v1.2.2: every RAVYN physical-input primitive asks the InputAudit first (scope-checked; combat input only via LegacyCombatAdapter)
+local function physicalGate(kind,detail)
+    local A=RAVYN.InputAudit
+    if not (A and A.physical) then return true end
+    return A.physical(kind,detail)
+end
 Hooks.pressMouse1=function()
     -- Cursor-dependent executor click input is intentionally avoided. v3.8.2 later replaces
     -- this dispatcher with a fixed-screen input path before Boot executes.
+    if not physicalGate("MOUSE","M1") then return false,"PHYSICAL_INPUT_BLOCKED" end
     local vu=liveService("VirtualUser")
     if vu then
         local ok=pcall(function()
@@ -2317,6 +2326,7 @@ end
 local function pressKey(text)
     local key=keyCodeFromText(text)
     if not key then return false,"KEY_UNMAPPED:"..tostring(text) end
+    if not physicalGate("KEY",text) then return false,"PHYSICAL_INPUT_BLOCKED" end
     local vim=liveService("VirtualInputManager")
     if vim then
         local ok=pcall(function()
@@ -2387,9 +2397,14 @@ Hooks.smartDestination=function(target,now)
     local smart=RAVYN.Config.SmartCombat
     local hp=healthPercent()
 
-    if hp<=smart.CriticalHealthPercent then LiveAction.evading=true end
-    if not LiveAction.evading and hp<=smart.LowHealthPercent then LiveAction.evading=true end
-    if LiveAction.evading and hp>=smart.RecoveryPercent then LiveAction.evading=false end
+    if smart.HealthSafetyEscape then
+        if hp<=smart.CriticalHealthPercent then LiveAction.evading=true end
+        if not LiveAction.evading and hp<=smart.LowHealthPercent then LiveAction.evading=true end
+        if LiveAction.evading and hp>=smart.RecoveryPercent then LiveAction.evading=false end
+    else
+        -- User-controlled combat stance: HP alone must never raise/retreat the player.
+        LiveAction.evading=false
+    end
 
     if LiveAction.evading then
         local h=hp<=smart.CriticalHealthPercent and profile.criticalAbove or profile.above
@@ -2460,6 +2475,12 @@ local function moveSmart(target,instant)
     if MO and not MO.bypass and (MO.current=="TRAVEL" or MO.current=="COMBAT_HOVER" or MO.current=="RECOVERY") then
         return result(true,"OWNED_BY_"..MO.current)
     end
+    -- v1.1 single movement authority: while the TravelController runs, a freshly acquired target (owner still IDLE for
+    -- one ownership step) is travelled to by the TravelController, never by this legacy teleport as well.
+    local tcv=RAVYN.Config.TravelController
+    if MO and not MO.bypass and MO.current=="IDLE" and tcv and tcv.Enabled and RAVYN.FSM and RAVYN.FSM.state=="RUNNING" then
+        return result(true,"DEFERRED_TO_TRAVEL_CONTROLLER")
+    end
     local now=os.clock()
     local dest,positionMode=Hooks.smartDestination(target,now)
     if not dest then return result(false,positionMode or "DESTINATION_UNAVAILABLE") end
@@ -2467,9 +2488,9 @@ local function moveSmart(target,instant)
     local dist=(root.Position-dest).Magnitude
     local profile=Hooks.activeProfile()
 
-    local useTeleport=instant or RAVYN.Config.Movement.TravelMode=="Teleport"
+    local useTeleport=instant or RAVYN.Config.Movement.TravelMode=="Teleport" or (RAVYN.Config.TravelController and RAVYN.Config.TravelController.TeleportOnly==true)
     local cm2=RAVYN.Config and RAVYN.Config.CombatMobility
-    if cm2 and cm2.Enabled and cm2.NoCombatTeleport and LiveAction.target then useTeleport=false
+    if not (RAVYN.Config.TravelController and RAVYN.Config.TravelController.TeleportOnly==true) and cm2 and cm2.Enabled and cm2.NoCombatTeleport and LiveAction.target then useTeleport=false
     elseif RAVYN.Config.SmartCombat.AdaptiveTravel and dist>=profile.longTeleport then useTeleport=true end
     if useTeleport then
         cancelTween()
@@ -2530,7 +2551,8 @@ local function selectTarget(kind,allowMove)
     local player=s.player or {}
     if not player.position then return nil end
     local cfg=(kind=="BOSS") and RAVYN.Config.Farm.Boss or RAVYN.Config.Farm.NormalMobs
-    local maxDistance=allowMove and math.min(cfg.MaxDistance,cfg.TargetRadius) or math.max(22,Hooks.activeProfile().attackDistance*1.75)
+    local unlimited=allowMove and RAVYN.Config.TravelController and RAVYN.Config.TravelController.UnlimitedRange
+    local maxDistance=unlimited and math.huge or (allowMove and math.min(cfg.MaxDistance,cfg.TargetRadius) or math.max(22,Hooks.activeProfile().attackDistance*1.75))
 
     local sticky=findSnapshotTarget(LiveAction.targetId)
     if sticky then
@@ -2611,10 +2633,11 @@ function RAVYN:GetObservedNPCs(kind,limit,query)
 end
 
 function RAVYN:ClientAttack()
-    local ok,source=Hooks.pressMouse1()
-    LiveAction.lastInputSource=source
-    self.Logger:log(ok and "INFO" or "WARN",ok and "M1_INPUT" or source,{source=source})
-    return result(ok,ok and "ATTACK_INPUT_SENT" or source)
+    local B=RAVYN.CombatActionBus
+    if not B then return result(false,"COMBAT_BUS_UNAVAILABLE") end
+    local r=B:RequestAttack(LiveAction.target,{source="ClientAttack"})
+    LiveAction.lastInputSource=(r.value and r.value.backend) or r.code
+    return r
 end
 
 function RAVYN:ClientSkill()
@@ -2622,10 +2645,12 @@ function RAVYN:ClientSkill()
     if #keys==0 then return result(false,"NO_VISIBLE_SKILL_KEYS") end
     LiveAction.skillCursor=(LiveAction.skillCursor%#keys)+1
     local chosen=keys[LiveAction.skillCursor]
-    local ok,src=pressKey(chosen.key)
-    LiveAction.lastInputSource=src
-    self.Logger:log(ok and "INFO" or "WARN",ok and ("SKILL_INPUT_"..chosen.key) or src,{source=src,index=chosen.index})
-    return result(ok,ok and "SKILL_INPUT_SENT" or src,chosen)
+    -- v1.2.2: the hotbar key is only an identifier; the CombatActionBus decides silent / legacy / nothing
+    local B=RAVYN.CombatActionBus
+    if not B then return result(false,"COMBAT_BUS_UNAVAILABLE") end
+    local r=B:RequestSkill(chosen,LiveAction.target,{source="ClientSkill"})
+    LiveAction.lastInputSource=(r.value and r.value.backend) or r.code
+    return r
 end
 
 function RAVYN:TeleportToNPC(query)
@@ -2819,6 +2844,7 @@ CTX["v3"]=v3
 CTX["safeSet"]=safeSet
 CTX["healthPercent"]=healthPercent
 CTX["keyCodeFromText"]=keyCodeFromText
+CTX["physicalGate"]=physicalGate
 CTX["pressKey"]=pressKey
 CTX["rawTargetRoot"]=rawTargetRoot
 CTX["targetBasis"]=targetBasis
@@ -2854,7 +2880,6 @@ local liveHumanoid=CTX["liveHumanoid"]
 local v3=CTX["v3"]
 local safeSet=CTX["safeSet"]
 local healthPercent=CTX["healthPercent"]
-local pressKey=CTX["pressKey"]
 local targetBasis=CTX["targetBasis"]
 local cancelTween=CTX["cancelTween"]
 local faceTarget=CTX["faceTarget"]
@@ -2948,6 +2973,10 @@ local function updateDamageRisk(now)
     local hpPct=(hp/maxHp)*100; local dpsPct=(Brain.damagePerSecond/maxHp)*100
     Brain.riskScore=math.min(100,math.max(0,100-hpPct)*.58+math.min(100,dpsPct*6.5)*.72)
     local sc=RAVYN.Config.SmartCombat; local damageRisk=RAVYN.Config.Intelligence.CombatBrain.DamageRisk
+    if sc.HealthSafetyEscape==false then
+        Brain.forceEvade=false; Brain.emergency384=false; LiveAction.evading=false
+        return
+    end
     local danger=(hpPct<=sc.LowHealthPercent) or (damageRisk and hpPct<68 and Brain.riskScore>=58)
     local critical=hpPct<=sc.CriticalHealthPercent or (damageRisk and hpPct<48 and Brain.riskScore>=82)
     local cm=RAVYN.Config and RAVYN.Config.CombatMobility
@@ -3015,7 +3044,8 @@ local function smartSearchRadius() return RADIUS_MAP[RAVYN.Config.Intelligence.S
 local function selectBrainTarget(kind,allowMove)
     local s=RAVYN.Features.snapshot or {}; local p=s.player or {}; if not p.position then return nil end
     local cfg=(kind=="BOSS") and RAVYN.Config.Farm.Boss or RAVYN.Config.Farm.NormalMobs
-    local maxDistance=allowMove and math.min(cfg.MaxDistance or math.huge,cfg.TargetRadius or math.huge,smartSearchRadius()) or math.max(22,Hooks.activeProfile().attackDistance*1.75)
+    local unlimited=allowMove and RAVYN.Config.TravelController and RAVYN.Config.TravelController.UnlimitedRange
+    local maxDistance=unlimited and math.huge or (allowMove and math.min(cfg.MaxDistance or math.huge,cfg.TargetRadius or math.huge,smartSearchRadius()) or math.max(22,Hooks.activeProfile().attackDistance*1.75))
     local sticky=findSnapshotTarget(LiveAction.targetId)
     if sticky then
         local isBoss=sticky.isBoss==true or sticky.classification=="BOSS"; local kindOk=(kind=="BOSS" and isBoss) or (kind=="MOB" and not isBoss)
@@ -3077,9 +3107,11 @@ function RAVYN:ClientSkillSmart(target,now)
     local best=nil
     for _,k in ipairs(keys) do local last=Brain.combo.lastSkillAt[k.key] or -math.huge; local cm=RAVYN.Config and RAVYN.Config.CombatMobility; local reuse=(cm and cm.Enabled and cm.AggressiveSkills) and math.max(.40,tonumber(cm.SkillInterval) or .55) or math.max(profile.skillDelay*2.2,2.2); if now-last>=reuse and k.key~=Brain.combo.lastSkillKey then best=k; break end end
     best=best or keys[(Brain.combo.stage-1)%#keys+1]
-    local ok,src=pressKey(best.key); LiveAction.lastInputSource=src
-    if ok then Brain.combo.lastSkillKey=best.key; Brain.combo.lastSkillAt[best.key]=now; Brain.combo.stage=(Brain.combo.stage%#keys)+1; Brain.combo.m1=0; Brain.combo.lastAction="SKILL "..best.key; self.Logger:log("INFO","SMART_SKILL_"..best.key,{target=target and target.name,index=best.index}); return result(true,"SMART_SKILL_SENT",best) end
-    return result(false,src,best)
+    -- v1.2.2: request through the CombatActionBus (hotbar key = identifier only)
+    local B=RAVYN.CombatActionBus; if not B then return result(false,"COMBAT_BUS_UNAVAILABLE",best) end
+    local r=B:RequestSkill(best,target,{source="SmartSkillsV37"}); LiveAction.lastInputSource=(r.value and r.value.backend) or r.code
+    if r.ok then Brain.combo.lastSkillKey=best.key; Brain.combo.lastSkillAt[best.key]=now; Brain.combo.stage=(Brain.combo.stage%#keys)+1; Brain.combo.m1=0; Brain.combo.lastAction="SKILL "..best.key; self.Logger:log("INFO","SMART_SKILL_"..best.key,{target=target and target.name,index=best.index}); return result(true,"SMART_SKILL_SENT",best) end
+    return result(false,r.code,best)
 end
 
 function RAVYN:SetAutoPlay(v)
@@ -3156,7 +3188,10 @@ end
 function RAVYN:SetAntiAFK(v) return self:SetConfig("Intelligence.AntiAFK",v==true) end
 local function antiAfkPulse()
     if not RAVYN.Config.Intelligence.AntiAFK then return end
-    local vu=liveService("VirtualUser"); if vu then pcall(function() vu:CaptureController(); vu:ClickButton2(Vector2.new(0,0)) end) end
+    local vu=liveService("VirtualUser"); if vu then
+        local A=RAVYN.InputAudit; if A and A.note then A.note("MOUSE","anti-AFK M2","ANTI_AFK") end -- not combat; audited
+        pcall(function() vu:CaptureController(); vu:ClickButton2(Vector2.new(0,0)) end)
+    end
 end
 do local players=liveService("Players"); local p=players and players.LocalPlayer; if p and p.Idled then local c=p.Idled:Connect(antiAfkPulse); Brain.afkConnection=c; table.insert(RAVYN._connections,c) end end
 
@@ -4721,7 +4756,6 @@ local liveRoot=CTX["liveRoot"]
 local liveHumanoid=CTX["liveHumanoid"]
 local v3=CTX["v3"]
 local keyCodeFromText=CTX["keyCodeFromText"]
-local pressKey=CTX["pressKey"]
 local rawTargetRoot=CTX["rawTargetRoot"]
 local targetBasis=CTX["targetBasis"]
 local groundSafe=CTX["groundSafe"]
@@ -4734,6 +4768,7 @@ local prop=CTX["prop"]
 local log=CTX["log"]
 local animatorOf=CTX["animatorOf"]
 local trackKey=CTX["trackKey"]
+local physicalGate=CTX["physicalGate"]
 -- v3.8.2 combat evolution: target-facing lock, cursor-independent combat input,
 -- adaptive dodge learning, reactive guard, heavy finishers and skill damage learning.
 RAVYN.Version="3.8.2-combat-evolution"
@@ -4812,6 +4847,7 @@ end
 local function setKeyState(text,down)
     local key=keyCodeFromText(text)
     if not key then return false,"KEY_UNMAPPED:"..tostring(text) end
+    if physicalGate and not physicalGate("KEY",tostring(text)..(down and " down" or " up")) then return false,"PHYSICAL_INPUT_BLOCKED" end
     local vim=liveService("VirtualInputManager")
     if vim then
         local ok=pcall(function() vim:SendKeyEvent(down,key,false,game) end)
@@ -4824,12 +4860,26 @@ local function setKeyState(text,down)
 end
 
 local function fixedMouseButton(button)
+    if physicalGate and not physicalGate("MOUSE",button==0 and "M1" or "M2") then return false,"PHYSICAL_INPUT_BLOCKED" end
     local cam=workspace.CurrentCamera
     local vp=cam and cam.ViewportSize or Vector2.new(1280,720)
     local x,y=math.floor(vp.X*.5),math.floor(vp.Y*.5)
-    local gui=RAVYN._gui; local guiWasEnabled=nil
-    if gui then pcall(function() guiWasEnabled=gui.Enabled; gui.Enabled=false end) end
-    local function restore() if gui and guiWasEnabled~=nil then pcall(function() gui.Enabled=guiWasEnabled end) end end
+    -- v3.9: never toggle RAVYN's ScreenGui per click (that flickered the whole menu at M1 rate).
+    -- Instead click at a point the RAVYN window does not cover: centre if free, else beside the window.
+    local gui=RAVYN._gui
+    local win=gui and gui.Enabled and gui:FindFirstChild("Window")
+    if win and win.Visible then
+        local ok,p,sz=pcall(function() return win.AbsolutePosition,win.AbsoluteSize end)
+        if ok and x>=p.X-8 and x<=p.X+sz.X+8 and y>=p.Y-8 and y<=p.Y+sz.Y+8 then
+            local left=p.X-48; local right=p.X+sz.X+48; local top=p.Y-48; local bottom=p.Y+sz.Y+48
+            if left>=40 then x=math.floor(left)
+            elseif right<=vp.X-40 then x=math.floor(right)
+            elseif top>=60 then y=math.floor(top)
+            elseif bottom<=vp.Y-120 then y=math.floor(bottom)
+            else RAVYN.CombatMobility=RAVYN.CombatMobility or {}; RAVYN.CombatMobility.m1Blocked="M1_POINT_COVERED_BY_UI" end
+        end
+    end
+    local function restore() end
     local vim=liveService("VirtualInputManager")
     if vim then
         local ok=pcall(function()
@@ -4937,7 +4987,8 @@ end
 
 local function resolveGuardKey(now)
     local cfg=evoCfg().Defense
-    if now-(Evolution.lastGuardResolve or 0)<2.0 then return Evolution.guardKey,Evolution.guardSource end
+    -- v1.1 perf: the guard key GUI scan is bounded (≤1000 nodes) but must not repeat every 2 s in long fights.
+    if now-(Evolution.lastGuardResolve or 0)<(Evolution.guardKey and 30 or 8) then return Evolution.guardKey,Evolution.guardSource end
     Evolution.lastGuardResolve=now
     local requested=tostring(cfg.BlockKey or "Auto")
     if requested~="Auto" then
@@ -4976,30 +5027,39 @@ local function resolveGuardKey(now)
     return nil,Evolution.guardSource
 end
 
+-- v1.2.2: guard / dodge are requests to the CombatActionBus. The resolved guard key is an identifier for the
+-- resolver and for LegacyCombatAdapter (HYBRID / LEGACY_INPUT only); nothing here presses a key.
 local function releaseGuard()
-    if Evolution.guardDown and Evolution.guardKey then setKeyState(Evolution.guardKey,false) end
+    local B=RAVYN.CombatActionBus
+    if B then pcall(function() B:RequestGuard(false,nil,{source="CombatEvolution"}) end) end
     Evolution.guardDown=false; Evolution.guardReleaseAt=0
 end
 local function holdGuard(now,duration)
     local cfg=evoCfg().Defense; if not cfg.ReactiveGuard then return false,"GUARD_DISABLED" end
-    local key,source=resolveGuardKey(now); if not key then return false,source end
-    if isSkillConflict(key) then return false,"GUARD_KEY_CONFLICT" end
-    if not Evolution.guardDown then
-        local ok,src=setKeyState(key,true); if not ok then return false,src end
-        Evolution.guardDown=true; Evolution.guardKey=key; Evolution.guardSource=source.."/"..src
-    end
+    local B=RAVYN.CombatActionBus; if not B then return false,"COMBAT_BUS_UNAVAILABLE" end
+    local key,source=resolveGuardKey(now)
+    if key and isSkillConflict(key) then key=nil; source="GUARD_KEY_CONFLICT" end
+    local r=B:RequestGuard(true,LiveAction.target,{source="CombatEvolution",key=key})
+    if not r.ok then return false,r.code end
+    Evolution.guardDown=true; Evolution.guardKey=key; Evolution.guardSource=tostring(source).."/"..tostring((r.value and r.value.backend) or "HELD")
     Evolution.guardReleaseAt=math.max(Evolution.guardReleaseAt or 0,now+(duration or cfg.GuardHold))
-    Brain.combo.lastAction="GUARD "..key
+    Brain.combo.lastAction="GUARD "..tostring(key or "·")
     return true,Evolution.guardSource
 end
-
 local function directionalDodge(side)
+    local B=RAVYN.CombatActionBus; if not B then return false,"COMBAT_BUS_UNAVAILABLE" end
+    local r=B:RequestDash(side,LiveAction.target,{source="CombatEvolution"})
+    return r.ok,r.ok and ("DASH · "..tostring(r.value and r.value.backend)) or r.code
+end
+-- raw VIM dodge: reached ONLY through LegacyCombatAdapter (CTX legacyDirectionalDodge)
+local function legacyDirectionalDodge(side)
     local cfg=evoCfg().Defense; local q=tostring(cfg.DodgeKey or "Q")
     if isSkillConflict(q) then return false,"DODGE_KEY_CONFLICT:"..q end
     local vim=liveService("VirtualInputManager")
     if not vim then return false,"DODGE_INPUT_UNAVAILABLE" end
     local sideKey=side<0 and Enum.KeyCode.A or Enum.KeyCode.D
     local dodge=keyCodeFromText(q); if not dodge then return false,"DODGE_KEY_UNMAPPED" end
+    if physicalGate and not physicalGate("KEY","DODGE "..q..(side<0 and "+A" or "+D")) then return false,"PHYSICAL_INPUT_BLOCKED" end
     local ok=pcall(function()
         vim:SendKeyEvent(true,sideKey,false,game)
         task.wait(.012)
@@ -5128,18 +5188,20 @@ function RAVYN:ClientAttack()
     local now=os.clock(); local cfg=evoCfg(); local target=LiveAction.target
     if cfg.Enabled and (Evolution.dodgeUntil>now or Evolution.guardDown) then return result(false,"DEFENSE_ACTIVE") end
     if cfg.Enabled and Evolution.skillLockUntil>now then return result(false,"SKILL_RECOVERY") end
+    -- facing only rotates the character (no mouse, no camera, no cursor aim)
     if target then faceCurrentTarget(target) end
+    -- v1.2.2: attacks are requests to the CombatActionBus (silent local action · labelled legacy · or nothing)
+    local B=RAVYN.CombatActionBus; if not B then return result(false,"COMBAT_BUS_UNAVAILABLE") end
     if cfg.Enabled and cfg.UseHeavyAttack and target and now-(Evolution.heavyLast or 0)>=cfg.HeavyCooldown and Brain.combo.m1>=math.max(2,math.floor(cfg.HeavyAfterM1 or 3)) then
         local pct=(target.health and target.maxHealth and target.maxHealth>0) and (target.health/target.maxHealth*100) or 100
         local afterSkill=string.find(tostring(Brain.combo.lastAction or ""),"SKILL",1,true)~=nil
         if pct<=38 or afterSkill then
-            local ok,src=pressMouse2(); LiveAction.lastInputSource=src
-            if ok then Evolution.heavyLast=now; Brain.combo.m1=0; Brain.combo.lastAction="M2 HEAVY"; self.Logger:log("INFO","COMBO_HEAVY",{target=target.name,hpPct=pct}); return result(true,"HEAVY_INPUT_SENT",{source=src}) end
+            local r=B:RequestAttack(target,{heavy=true,source="CombatEvolution"}); LiveAction.lastInputSource=(r.value and r.value.backend) or r.code
+            if r.ok then Evolution.heavyLast=now; Brain.combo.m1=0; Brain.combo.lastAction="M2 HEAVY"; self.Logger:log("INFO","COMBO_HEAVY",{target=target.name,hpPct=pct}); return r end
         end
     end
-    local ok,src=Hooks.pressMouse1(); LiveAction.lastInputSource=src
-    self.Logger:log(ok and "INFO" or "WARN",ok and "M1_FIXED_INPUT" or src,{source=src,target=target and target.name})
-    return result(ok,ok and "ATTACK_INPUT_SENT" or src)
+    local r=B:RequestAttack(target,{source="CombatEvolution"}); LiveAction.lastInputSource=(r.value and r.value.backend) or r.code
+    return r
 end
 
 local clientSkillSmartV382Base=RAVYN.ClientSkillSmart
@@ -5157,15 +5219,16 @@ function RAVYN:ClientSkillSmart(target,now)
     local best,bestScore=nil,-math.huge
     for _,k in ipairs(keys) do local score=skillScore(k,now); if score>bestScore then best,bestScore=k,score end end
     if not best then return result(false,"SKILL_RECOVERY") end
-    local ok,src=pressKey(best.key); LiveAction.lastInputSource=src
-    if ok then
+    local B=RAVYN.CombatActionBus; if not B then return result(false,"COMBAT_BUS_UNAVAILABLE",best) end
+    local r=B:RequestSkill(best,target,{source="CombatEvolution"}); LiveAction.lastInputSource=(r.value and r.value.backend) or r.code
+    if r.ok then
         Brain.combo.lastSkillKey=best.key; Brain.combo.lastSkillAt[best.key]=now; Brain.combo.stage=(Brain.combo.stage%#keys)+1; Brain.combo.m1=0; Brain.combo.lastAction="SKILL "..best.key
         Evolution.skillUseCount+=1; Evolution.skillLockUntil=now+(cfg.Learning.SkillLock or .42)
         Evolution.pendingSkill={key=best.key,targetId=target and target.id,hpBefore=target and target.health,maxHealth=target and target.maxHealth,at=now}
         self.Logger:log("INFO","ADAPTIVE_SKILL_"..best.key,{target=target and target.name,index=best.index,score=bestScore})
         return result(true,"ADAPTIVE_SKILL_SENT",best)
     end
-    return result(false,src,best)
+    return result(false,r.code,best)
 end
 
 local tickV382Base=RAVYN._tick
@@ -5184,7 +5247,9 @@ Evolution.fastObserverToken=(Evolution.fastObserverToken or 0)+1
 local fastObserverToken=Evolution.fastObserverToken
 task.spawn(function()
     while not RAVYN._destroyed and Evolution.fastObserverToken==fastObserverToken do
-        if RAVYN.FSM.state=="RUNNING" and evoCfg().Enabled then
+        -- v1.2.1+: defense requests also pause while the InstaKillAdapter verifies its single finisher (the bus refuses them too)
+        local ika=RAVYN.InstaKillAdapter
+        if RAVYN.FSM.state=="RUNNING" and evoCfg().Enabled and not (ika and ika.locked) then
             local now=os.clock(); local target=LiveAction.target
             pcall(function() observeDefense(now,target) end)
             pcall(function() evaluateSkillLearning(now,target) end)
@@ -5236,6 +5301,7 @@ CTX["resolveGuardKey"]=resolveGuardKey
 CTX["releaseGuard"]=releaseGuard
 CTX["holdGuard"]=holdGuard
 CTX["directionalDodge"]=directionalDodge
+CTX["legacyDirectionalDodge"]=legacyDirectionalDodge
 CTX["baseSmartDestinationV382"]=baseSmartDestinationV382
 CTX["triggerDodge"]=triggerDodge
 CTX["threatState"]=threatState
@@ -5340,27 +5406,29 @@ do local fn,err=loadstring([==========[return function(RAVYN)
     end
 
     local function questTexts()
+        -- v3.9.2 performance: read only the verified quest roots.
+        -- Never scan the whole PlayerGui on the normal automation loop.
         local texts={}; local seen={}
         local p=game:GetService("Players").LocalPlayer; local pg=p and p:FindFirstChildOfClass("PlayerGui")
         if not pg then return texts end
-        local desc=safe(function() return pg:GetDescendants() end,{})
-        local n=0
-        for _,g in ipairs(desc) do
-            n=n+1; if n>2200 or #texts>=140 then break end
+        local ch=pg:FindFirstChild("ComponentsHolder")
+        local lc=ch and ch:FindFirstChild("LeftCenterFramesHolder")
+        local roots={lc and lc:FindFirstChild("zQuestsFrame"),ch and ch:FindFirstChild("QuestionStrip")}
+        local scanned=0
+        local function take(g)
+            if scanned>=700 or #texts>=100 then return end
+            scanned+=1
             if g:IsA("TextLabel") or g:IsA("TextButton") then
                 local vis=safe(function() return g.Visible end,false)
                 local txt=vis and clean(safe(function() return g.Text end,"")) or ""
-                if txt~="" then
-                    local chain=""; local cur=g
-                    for _=1,5 do
-                        if not cur then break end
-                        chain=chain.."/"..low(safe(function() return cur.Name end,"")); cur=safe(function() return cur.Parent end,nil)
-                    end
-                    local l=low(txt)
-                    local named=string.find(chain,"quest",1,true) or string.find(chain,"objective",1,true) or string.find(chain,"mission",1,true) or string.find(chain,"crow",1,true) or string.find(chain,"muzan",1,true)
-                    local semantic=string.find(l,"kill",1,true) or string.find(l,"defeat",1,true) or string.find(l,"slay",1,true) or string.find(l,"eliminate",1,true) or string.find(l,"collect",1,true) or string.find(l,"gather",1,true) or string.find(l,"talk",1,true) or string.find(l,"speak",1,true) or string.find(l,"return",1,true) or string.find(l,"objective",1,true) or string.find(l,"mission",1,true) or string.find(l,"quest",1,true)
-                    if (named or semantic) and not seen[txt] then seen[txt]=true; table.insert(texts,txt) end
-                end
+                if txt~="" and not seen[txt] then seen[txt]=true; table.insert(texts,txt) end
+            end
+        end
+        for _,root in ipairs(roots) do
+            if root then
+                take(root)
+                local desc=safe(function() return root:GetDescendants() end,{})
+                for _,g in ipairs(desc) do take(g); if scanned>=700 or #texts>=100 then break end end
             end
         end
         return texts
@@ -5450,10 +5518,23 @@ do local fn,err=loadstring([==========[return function(RAVYN)
     end
     local function findQuestPrompt(now)
         local root=rootPart(); if not root then return nil end
-        local best,bestScore=nil,-math.huge; local list=safe(function() return workspace:GetDescendants() end,{})
-        local cap=0
+        local best,bestScore=nil,-math.huge
+        -- v3.9: only prompts inside PromptRadius can win, so query that sphere instead of the whole workspace
+        -- (previously a full workspace:GetDescendants() every tick while no quest was active).
+        if now-(A.lastPromptScan or 0)<.25 then return A.lastPromptPick end
+        A.lastPromptScan=now
+        local list={}; local seenHolder={}
+        local radius=(tonumber(RAVYN.Config.AdaptiveIntel.PromptRadius) or 18)+6
+        local parts=safe(function() return workspace:GetPartBoundsInRadius(root.Position,radius) end,{})
+        for i,part in ipairs(parts) do
+            if i>500 then break end
+            local holder=part:FindFirstAncestorWhichIsA("Model") or part
+            if not seenHolder[holder] then
+                seenHolder[holder]=true
+                for _,d in ipairs(safe(function() return holder:GetDescendants() end,{})) do if d:IsA("ProximityPrompt") then table.insert(list,d) end end
+            end
+        end
         for _,x in ipairs(list) do
-            cap=cap+1; if cap>6500 then break end
             if x:IsA("ProximityPrompt") and safe(function() return x.Enabled end,true) then
                 local source=promptSource(x)
                 if source then
@@ -5474,6 +5555,7 @@ do local fn,err=loadstring([==========[return function(RAVYN)
                 end
             end
         end
+        A.lastPromptPick=best
         return best
     end
 
@@ -5505,6 +5587,7 @@ do local fn,err=loadstring([==========[return function(RAVYN)
         if not best then return false end
         A.lastDialogueAttempt=now
         local pos=best.AbsolutePosition; local size=best.AbsoluteSize; local x=math.floor(pos.X+size.X*.5); local y=math.floor(pos.Y+size.Y*.5)
+        local IA=RAVYN.InputAudit; if IA and IA.note then IA.note("MOUSE","dialogue "..tostring(best.Text),"DIALOGUE") end
         local ok=pcall(function() vim:SendMouseButtonEvent(x,y,0,true,game,0); task.wait(.025); vim:SendMouseButtonEvent(x,y,0,false,game,0) end)
         if ok then A.pendingInteraction=A.pendingInteraction or {kind="DIALOGUE",id=tostring(best),at=now,before=A.quest and A.quest.signature or ""}; A.status="QUEST DIALOGUE · VERIFYING" end
         return ok
@@ -5611,11 +5694,16 @@ local defaults={
     Enabled=true,
     CombatRadius=16,        -- enter COMBAT_HOVER at or below
     CombatExitRadius=30,    -- leave COMBAT_HOVER above (hysteresis)
-    TweenMaxDist=70,        -- 0..70 tween
-    FastTweenMaxDist=220,   -- 70..220 fast tween, >220 teleport once
+    TweenMaxDist=70,        -- legacy fallback only; v3.9.2 defaults to teleport-only
+    FastTweenMaxDist=220,   -- legacy fallback only
     TweenSpeed=190,
     FastTweenSpeed=320,
-    TeleportCooldown=4,
+    TeleportOnly=true,      -- ALL navigation uses direct teleport by default
+    UnlimitedRange=true,    -- target selection ignores travel-distance caps
+    TeleportCooldown=.20,   -- anti-spam only; not a distance limit
+    TeleportRetargetDrift=6,
+    ReturnToBossOnRespawn=true,
+    RespawnReturnDelay=1.25,
     RetweenDrift=8,
     StuckTimeout=5,
     ArriveHeight=5.5,
@@ -5632,10 +5720,10 @@ function Config.validate(c)
     local t=c.TravelController
     if type(t)~="table" then table.insert(errors,"TravelController")
     else
-        for _,k in ipairs({"CombatRadius","CombatExitRadius","TweenMaxDist","FastTweenMaxDist","TweenSpeed","FastTweenSpeed","TeleportCooldown","RetweenDrift","StuckTimeout","ArriveHeight","NoclipReleaseGrace"}) do
+        for _,k in ipairs({"CombatRadius","CombatExitRadius","TweenMaxDist","FastTweenMaxDist","TweenSpeed","FastTweenSpeed","TeleportCooldown","TeleportRetargetDrift","RespawnReturnDelay","RetweenDrift","StuckTimeout","ArriveHeight","NoclipReleaseGrace"}) do
             if type(t[k])~="number" or t[k]~=t[k] or t[k]<0 then table.insert(errors,"TravelController."..k) end
         end
-        if type(t.TravelNoclip)~="boolean" or type(t.CombatNoclip)~="boolean" then table.insert(errors,"TravelController.Noclip") end
+        if type(t.TravelNoclip)~="boolean" or type(t.CombatNoclip)~="boolean" or type(t.TeleportOnly)~="boolean" or type(t.UnlimitedRange)~="boolean" or type(t.ReturnToBossOnRespawn)~="boolean" then table.insert(errors,"TravelController.Flags") end
         if type(t.CombatExitRadius)=="number" and type(t.CombatRadius)=="number" and t.CombatExitRadius<t.CombatRadius then table.insert(errors,"TravelController.CombatExitRadius") end
     end
     return #errors==0,errors
@@ -5646,8 +5734,8 @@ local MO={
     current="IDLE",previous="IDLE",since=os.clock(),reason="BOOT",transitions=0,history={},
     bypass=false,external=nil,
     travelTween=nil,travelDest=nil,travelKey=nil,travelMode="—",travelStartedAt=0,
-    progressPos=nil,progressAt=0,lastTeleportAt=-math.huge,lastTeleportKey=nil,teleports=0,tweens=0,
-    lastTargetSeenAt=0,liveDistance=nil,
+    progressPos=nil,progressAt=0,lastTeleportAt=-math.huge,lastTeleportKey=nil,lastTeleportDest=nil,teleports=0,tweens=0,
+    lastTargetSeenAt=0,liveDistance=nil,lastBoss=nil,lastRespawnReturn=nil,
 }
 RAVYN.MoveOwner=MO
 
@@ -5723,6 +5811,34 @@ local function travelTo(dest,reason,key)
     local here=root.Position; local d=(here-dest).Magnitude
     MO.liveDistance=d
     if d<=2.5 then stopTravelTween(); MO.travelMode="ARRIVED"; return result(true,"ARRIVED") end
+    -- v3.9.2: teleport-only navigation. Distance is intentionally unlimited.
+    if c.TeleportOnly or RAVYN.Config.Movement.TravelMode=="Teleport" then
+        stopTravelTween(); pcall(cancelTween)
+        local drift=(MO.lastTeleportDest and (MO.lastTeleportDest-dest).Magnitude) or math.huge
+        local sameGoal=MO.lastTeleportKey==key
+        -- v1.1 anti-spam: a teleport to the same goal that does not hold (server correction, blocked spot)
+        -- is retried at most 3× in 4 s, then that goal backs off for 2 s instead of looping.
+        if MO.tpBackoffKey==key and now<(MO.tpBackoffUntil or 0) then return result(true,"TELEPORT_BACKOFF") end
+        if sameGoal and drift<=(c.TeleportRetargetDrift or 6) then
+            if now-MO.lastTeleportAt<(c.TeleportCooldown or .20) then return result(true,"TELEPORT_COOLDOWN") end
+            if now-(MO.repeatTpAt or -math.huge)<4 then MO.repeatTp=(MO.repeatTp or 0)+1 else MO.repeatTp=1 end
+            MO.repeatTpAt=now
+            if MO.repeatTp>3 then
+                MO.repeatTp=0; MO.tpBackoffKey=key; MO.tpBackoffUntil=now+2; MO.stuckEvents=(MO.stuckEvents or 0)+1
+                RAVYN.Logger:log("WARN","TRAVEL_STUCK · teleport did not hold, backing off",{key=key})
+                return result(true,"TELEPORT_BACKOFF")
+            end
+        else MO.repeatTp=0 end
+        local look=Vector3.new(dest.X,dest.Y,dest.Z+0.01)
+        local ok=pcall(function() root.CFrame=CFrame.lookAt(dest,look) end)
+        if ok then
+            MO.lastTeleportAt=now; MO.lastTeleportKey=key; MO.lastTeleportDest=dest; MO.teleports=MO.teleports+1; MO.travelMode="TELEPORT"
+            LiveAction.lastMessage="TELEPORT → "..tostring(reason)
+            return result(true,"TELEPORTED")
+        end
+        return result(false,"TELEPORT_FAILED")
+    end
+    -- legacy tween fallback (only if TeleportOnly is manually disabled in Developer mode)
     -- stuck detection while tweening
     if tweenPlaying() then
         if MO.progressPos and (here-MO.progressPos).Magnitude<1 and now-MO.progressAt>=c.StuckTimeout then
@@ -5816,6 +5932,9 @@ local function ownershipStep()
     local tp=target and targetBasis(target)
     if target and tp and allowMove then
         MO.lastTargetSeenAt=now
+        if target.isBoss==true or target.classification=="BOSS" then
+            MO.lastBoss={id=target.id,name=target.name,position=tp,at=now}
+        end
         local d=(root.Position-tp).Magnitude; MO.liveDistance=d
         local inHover=HOVER_SET[MO.current]==true
         local wantHover=inHover and d<=c.CombatExitRadius or d<=c.CombatRadius
@@ -5829,7 +5948,7 @@ local function ownershipStep()
         end
         -- v3.8.4.2: a just-acquired far target must stay locked briefly before a teleport-tier move
         if MO.lockId~=target.id then MO.lockId=target.id; MO.lockSince=now end
-        if not wantHover and d>c.FastTweenMaxDist and now-(MO.lockSince or now)<.35 then
+        if not c.TeleportOnly and not wantHover and d>c.FastTweenMaxDist and now-(MO.lockSince or now)<.35 then
             stopTravelTween(); return
         end
         local LC=RAVYN.LootController
@@ -5885,8 +6004,30 @@ end
 do
     local p=game:GetService("Players").LocalPlayer
     if p then
-        local conn=p.CharacterAdded:Connect(function()
-            stopTravelTween(); noclipDisable("RESPAWN"); MO.lastTeleportKey=nil; setOwner("IDLE","RESPAWN")
+        local conn=p.CharacterAdded:Connect(function(char)
+            local boss=MO.lastBoss
+            stopTravelTween(); noclipDisable("RESPAWN"); MO.lastTeleportKey=nil; MO.lastTeleportDest=nil; MO.tpBackoffKey=nil; setOwner("IDLE","RESPAWN")
+            if not (tc().ReturnToBossOnRespawn and boss and boss.position) then return end
+            -- v1.1: the BossController owns respawn return (generation token, fresh same-boss check, no return to a dead boss)
+            local BC=RAVYN.BossController
+            if BC and BC.onRespawn then local okR=pcall(BC.onRespawn,char,boss); if okR then return end end
+            task.spawn(function()
+                local root=char and char:WaitForChild("HumanoidRootPart",12)
+                if not root then return end
+                task.wait(tc().RespawnReturnDelay or 1.25)
+                if not RAVYN.FSM or RAVYN.FSM.state~="RUNNING" then return end
+                local dest=boss.position
+                -- Prefer a fresh live position if the same boss is still present.
+                for _,e in ipairs((RAVYN.Features.snapshot or {}).npcs or {}) do
+                    if (e.id==boss.id or (boss.name and e.name==boss.name)) and (e.isBoss==true or e.classification=="BOSS") and e.position and e.alive~=false then
+                        dest=Vector3.new(e.position.x,e.position.y,e.position.z); break
+                    end
+                end
+                local h=(RAVYN.Config.CombatMobility and RAVYN.Config.CombatMobility.FlyHeight) or tc().ArriveHeight
+                MO.lastTeleportKey=nil; MO.lastTeleportDest=nil
+                local r=travelTo(dest+Vector3.new(0,h,0),"RETURN TO BOSS · "..tostring(boss.name or "Boss"),"respawn-boss:"..tostring(boss.id or boss.name))
+                MO.lastRespawnReturn={at=os.clock(),boss=boss.name,code=r and r.code}
+            end)
         end)
         table.insert(RAVYN._connections,conn)
     end
@@ -5965,7 +6106,9 @@ CTX["readBossMeta"]=readBossMeta
 local function refreshBossEligibility(now)
     local s=RAVYN.Features.snapshot or {}; local p=s.player or {}
     local cfg=RAVYN.Config.Farm.Boss
-    local radius=math.min(cfg.MaxDistance or math.huge,cfg.TargetRadius or math.huge,RADIUS_MAP[RAVYN.Config.Intelligence.SearchRadius] or 250)
+    -- v1.1: teleport-first. With UnlimitedRange the old 250/500-stud eligibility caps no longer apply.
+    local tcx=RAVYN.Config.TravelController
+    local radius=(tcx and tcx.UnlimitedRange) and math.huge or math.min(cfg.MaxDistance or math.huge,cfg.TargetRadius or math.huge,RADIUS_MAP[RAVYN.Config.Intelligence.SearchRadius] or 250)
     local diag={}; local count=0; local seenNames={}
     for _,e in ipairs(s.npcs or {}) do
         if e.isBoss==true or e.classification=="BOSS" then
@@ -6006,6 +6149,10 @@ end
 -- Returns nil | "RESOLVED" (target known via text or learned memory) | "LEARNING".
 local function questState()
     if not (RAVYN.Config.Intelligence and RAVYN.Config.Intelligence.AutoPlay) then return nil end
+    -- v1.1: an objective read from LOCAL quest data (Quests.Holder.*.Tasks.*.Code) outranks GUI-text parsing.
+    -- Streamed target → RESOLVED (fight it). Not streamed → LEARNING (no random farming while DirectCore travels).
+    local D=RAVYN.Direct; local ob=D and D.objective
+    if ob and ob.name and not ob.parked then return ob.streamed and "RESOLVED" or "LEARNING" end
     local A=RAVYN.AdaptiveIntel; local QB=RAVYN.QuestBrain; local ai=RAVYN.Config.AdaptiveIntel
     local q=A and A.quest
     if not (q and q.state=="ACTIVE" and ai and ai.Enabled and ai.PreferActiveQuest) then return nil end
@@ -6103,22 +6250,22 @@ local requestTravel=CTX["requestTravel384"]
 -- This layer adds: source discovery at any streamed distance, source memory, travel to source,
 -- accept/turn-in verification bookkeeping, target correlation learning, level-up rescans.
 local defaults={
-    -- v3.8.4.1: Crow + Muzan are part of the one-switch Auto Play preset (they only ever run while
-    -- Auto Play is ON). Each toggle can still be turned off individually. Generic givers stay opt-in.
-    AutoQuest=false, AutoCrow=true, AutoMuzan=true, PresetVersion=1,
+    -- v3.8.5.1: Crow/Muzan runtime semantics are UNRESOLVED (GameKnowledge). Default OFF and execution is
+    -- gated by the capability provider until live evidence maps them. Legacy code is kept but cannot act.
+    AutoQuest=false, AutoCrow=false, AutoMuzan=false, PresetVersion=2,
     -- v3.8.5: an unresolved quest target is investigated through evidence (quest markers), not random farming.
     -- Learning by killing nearby mobs is opt-in.
     LearnByNearbyKills=false,
     RepeatCrow=true, RepeatMuzan=true, AutoTurnIn=true,
-    SourceScanInterval=3, InteractTimeout=8, SourceBackoff=30, StallSeconds=90,
+    SourceScanInterval=8, InteractTimeout=8, SourceBackoff=30, StallSeconds=90,
     KnownSources={}, TargetMemory={},
 }
 Config.Default.QuestBrain=Util.deepCopy(defaults)
 do
     local saved=RAVYN.Config.QuestBrain
-    -- one-time preset migration: settings saved before the preset existed get Crow/Muzan enabled once;
-    -- after that, the user's own toggles are respected.
-    if type(saved)=="table" and (tonumber(saved.PresetVersion) or 0)<1 then saved.AutoCrow=true; saved.AutoMuzan=true; saved.PresetVersion=1 end
+    -- v3.8.5.1 migration: v3.8.4.1–v3.8.5 force-enabled Crow/Muzan through a preset (not a user choice).
+    -- Reset them once to OFF; never migrate them to true.
+    if type(saved)=="table" and (tonumber(saved.PresetVersion) or 0)<2 then saved.AutoCrow=false; saved.AutoMuzan=false; saved.PresetVersion=2 end
 end
 RAVYN.Config.QuestBrain=Util.deepMerge(defaults,RAVYN.Config.QuestBrain or {})
 local function qc() return RAVYN.Config.QuestBrain end
@@ -6139,15 +6286,23 @@ local function event(text,kind)
     RAVYN.Logger:log("INFO","QUEST · "..text,{})
 end
 local function setState(s,why) if QB.state~=s then QB.state=s end; QB.failReason=why end
+-- capability gate: Crow/Muzan sources may only act when the capability provider says the system is runtime-capable
+local GATE={CROW="CROW_MISSION",MUZAN="MUZAN_HUNT"}
+local function capable(t)
+    local key=GATE[t]; if not key then return true end
+    local GK=RAVYN.GameKnowledge
+    return GK~=nil and GK.capable~=nil and GK.capable(key)==true
+end
+QB.capable=capable
 local function wantedType(t)
     local c=qc()
-    if t=="CROW" then return c.AutoCrow end
-    if t=="MUZAN" then return c.AutoMuzan end
+    if t=="CROW" then return c.AutoCrow and capable("CROW") end
+    if t=="MUZAN" then return c.AutoMuzan and capable("MUZAN") end
     return c.AutoQuest
 end
 local function enabled()
     local c=qc()
-    return RAVYN.Config.Intelligence and RAVYN.Config.Intelligence.AutoPlay and (c.AutoQuest or c.AutoCrow or c.AutoMuzan)
+    return RAVYN.Config.Intelligence and RAVYN.Config.Intelligence.AutoPlay and (c.AutoQuest or wantedType("CROW") or wantedType("MUZAN"))
 end
 
 -- ---------- source discovery (any distance within stream) ----------
@@ -6360,6 +6515,8 @@ local function diff(before,after)
     return lines,nums,verbs,npcList
 end
 local function probeBegin(kind)
+    -- v1.1 perf: automatic QuestProbe snapshots are research; they only run in Developer Mode (manual capture always works)
+    if kind~="MANUAL" and not (RAVYN.Config.UI and RAVYN.Config.UI.DeveloperMode) then return end
     if QP.pending[kind] then return end
     QP.pending[kind]=snapshot("BEFORE_"..kind)
 end
@@ -6470,8 +6627,39 @@ local function navigate(src,kind,q,now)
     end
 end
 
+-- v3.8.5.1 legacy gate: AdaptiveIntel.autoQuestSource can fire any nearby prompt it classifies as crow/muzan
+-- whenever Auto Play is ON, even with every QuestBrain toggle off. While those systems are not runtime-capable,
+-- keep such prompts in its existing promptRejectUntil table (refreshed 1.5s window). No legacy code is deleted.
+QB.gateBlocked=0
+local function gateLegacy(now)
+    local A=RAVYN.AdaptiveIntel; if not (A and A.promptRejectUntil) then return end
+    if capable("CROW") and capable("MUZAN") then return end
+    if now-(QB.lastGateSweep or 0)<.5 then return end
+    QB.lastGateSweep=now
+    local root=liveRoot(); if not root then return end
+    local radius=((RAVYN.Config.AdaptiveIntel and RAVYN.Config.AdaptiveIntel.PromptRadius) or 18)+10
+    local ok,parts=pcall(function() return workspace:GetPartBoundsInRadius(root.Position,radius) end)
+    if not ok then return end
+    local seen={}; local n=0
+    for i,part in ipairs(parts) do
+        if i>400 then break end
+        local holder=part:FindFirstAncestorWhichIsA("Model") or part
+        if not seen[holder] then
+            seen[holder]=true
+            for _,d in ipairs(holder:GetDescendants()) do
+                if d:IsA("ProximityPrompt") then
+                    local t=promptSource(d)
+                    if (t=="CROW" or t=="MUZAN") and not capable(t) then reject(A,d:GetFullName(),now+1.5); n=n+1 end
+                end
+            end
+        end
+    end
+    QB.gateBlocked=n
+end
+
 local function tick()
     local now=os.clock()
+    if RAVYN.Config.Intelligence and RAVYN.Config.Intelligence.AutoPlay and RAVYN.FSM and RAVYN.FSM.state=="RUNNING" then pcall(gateLegacy,now) end
     if not enabled() or not (RAVYN.FSM and RAVYN.FSM.state=="RUNNING") then
         QB.navigating=false; QB.learnedOverride=nil; QB.phase="IDLE"
         if QB.state~="IDLE" then setState("IDLE",nil) end
@@ -6480,7 +6668,17 @@ local function tick()
     local A=RAVYN.AdaptiveIntel
     if not A then setState("ADAPTIVE INTEL MISSING","ADAPTIVE_INTEL_UNAVAILABLE"); QB.navigating=false; return end
     local q=A.quest or {state="NONE"}
-    levelCheck(); scanSources(now); learn(q,now)
+    levelCheck()
+    -- v3.9.1: cross-check replicated player quest data with the quest GUI (read-only, ≤ every 2s).
+    -- Decision logic is unchanged until the data semantics are mapped; this is evidence + display.
+    if RAVYN.DataAdapters and now-(QB.dataCheckAt or 0)>2 then
+        QB.dataCheckAt=now
+        local okD,d=pcall(RAVYN.DataAdapters.Quests)
+        if okD and d then QB.dataCheck=d; QB.questIdentity=d.questStateIdentity end
+    end
+    -- v3.9 perf: a full workspace source scan is only needed while acquiring/turning in (never during ACTIVE combat)
+    if q.state~="ACTIVE" then scanSources(now) end
+    learn(q,now)
     QB.objective=q.objectiveType or "NONE"; QB.progress=q.progress; QB.required=q.required
     -- verification of transitions driven by quest signature changes
     local sig=q.signature
@@ -6573,6 +6771,8 @@ end
 function RAVYN:SetQuestOption(key,value)
     local allowed={AutoQuest=true,AutoCrow=true,AutoMuzan=true,RepeatCrow=true,RepeatMuzan=true,AutoTurnIn=true,LearnByNearbyKills=true}
     if not allowed[key] or type(value)~="boolean" then return result(false,"INVALID_QUEST_OPTION") end
+    if value and (key=="AutoCrow" or key=="RepeatCrow") and not capable("CROW") then return result(false,"RESEARCH_REQUIRED",{system="CROW_MISSION"}) end
+    if value and (key=="AutoMuzan" or key=="RepeatMuzan") and not capable("MUZAN") then return result(false,"RESEARCH_REQUIRED",{system="MUZAN_HUNT"}) end
     local r=self:SetConfig("QuestBrain."..key,value)
     if r.ok and value and (key=="AutoCrow" or key=="AutoMuzan" or key=="AutoQuest") then QB.lastScanAt=-math.huge end
     return r
@@ -6622,7 +6822,7 @@ local P=CTX["JobPriority"]
 local defaults={
     AutoLootAfterKill=true, AutoLootChests=true, CollectNearbyLoot=false,
     LootSpawnWait=0.35, LootRescanInterval=0.15, LootQuietWindow=1.0, LootSessionTimeout=10,
-    KillLootRadius=26, ChestSearchRadius=80, ImmediateChestRadius=40, ChestScanInterval=1.5,
+    KillLootRadius=26, ChestSearchRadius=80, ImmediateChestRadius=40, ChestScanInterval=3,
     QuestLootRadius=18, QuestLootTimeout=5, MaxPreemptedSeconds=30,
     ChestIdentityRadius=140, ChestSpawnWait=10, ChestDropRadius=22, BossLootTimeout=25,
 }
@@ -6983,6 +7183,8 @@ end
 local function tick()
     local now=os.clock()
     if not (RAVYN.FSM and RAVYN.FSM.state=="RUNNING") then if LC.active then S=nil; LC.active=false; LC.state="IDLE" end; return end
+    -- v1.2: while BossLootController V2 owns a boss-chest session, the generic (v3.8.4.2) path stays idle
+    if LC.v2Active then return end
     local root=liveRoot(); if not root then return end
     if LC.active and S then
         local dt=now-(S.lastTickAt or now); S.lastTickAt=now
@@ -7069,7 +7271,8 @@ AP.push=feed
 -- mirror important log lines into the live feed (bounded, deduplicated by message)
 do
     local L=RAVYN.Logger; local baseLog=L.log; local last=nil
-    local keep={"QUEST · ","LOOT · ","MOVE_OWNER","TRAVEL_TELEPORT","TRAVEL_STUCK","NOCLIP_RESTORED","ADAPTIVE_LOADOUT_CHANGED","ADAPTIVE_QUEST_CHANGED","AUTOPLAY_BOSS_DOWN","SMART_SKILL_"}
+    -- v3.9: meaningful events only (no per-M1 / per-skill-attempt / per-owner-flip entries)
+    local keep={"QUEST · ","LOOT · ","TRAVEL_STUCK","ADAPTIVE_LOADOUT_CHANGED","SKILL_VERIFIED_","RECOVERY_STARTED","TARGET_ACQUIRED"}
     function L:log(level,message,meta)
         baseLog(self,level,message,meta)
         local m=tostring(message)
@@ -7087,8 +7290,8 @@ local function snapshotEntity(id)
 end
 
 local readBossMeta=CTX["readBossMeta"]
-RAVYN.Version="3.8.5-game-knowledge"
-RAVYN.Build="2026-09-27-v3.8.5-game-knowledge"
+RAVYN.Version="Direct-v1.0-foundation"
+RAVYN.Build="2026-09-27-direct-v1-foundation"
 -- ================= TargetCombatSession (v3.8.4.3) =================
 -- One session per RAVYN-locked target. Everything loot needs (name, BossInfo.Chest, rarity, last position/HP)
 -- is cached WHILE ALIVE, so death resolution never depends on the model still existing.
@@ -7130,6 +7333,7 @@ local function openSession(self,t,now)
     TCS={token=AP.token,id=t.id,name=t.name,boss=t.isBoss==true or t.classification=="BOSS",createdAt=now,lastSeenAt=now,
         baselineAt=-math.huge,lastRavynAttackAt=nil,deathHandled=false,source=farmSource(self),metaRead=false}
     H.session=TCS.token; H.handled=false; H.deathBy=nil; H.context="NONE"; H.startCalled=false; H.startResult=nil
+    if TCS.boss then RAVYN.Logger:log("INFO","TARGET_ACQUIRED · "..tostring(t.name),{}) end
     return TCS
 end
 local function refreshSession(self,s,t,now)
@@ -7177,6 +7381,7 @@ local function deathEvidence(s,now)
 end
 local function handleDeath(self,s,by,now)
     s.deathHandled=true; deathQueue=nil; AP.deathPending=true
+    AP.deadIds=AP.deadIds or {}; AP.deadIds[s.id]=now -- v1.2: a stale snapshot must not re-open (and re-count) this death
     H.deathBy=by; H.handled=true; H.lastAt=now; H.lastBoss=s.boss and s.name or nil; H.resolutions=H.resolutions+1
     AP.kills=AP.kills+1; if s.boss then AP.bossKills=AP.bossKills+1 end; AP.lastKillEvidence=by
     local JS=self.JobScheduler; local questKill=JS and JS.job=="ACTIVE_QUEST" or false
@@ -7233,6 +7438,10 @@ function RAVYN:_tick()
     --    or when a different LIVE target is locked while the old one is still alive (retarget).
     local now=os.clock()
     local t=LiveAction.target
+    -- v1.2: the NPC snapshot refreshes every ~0.3 s; a target resolved dead moments ago is dropped, not re-engaged
+    if t and t.id and AP.deadIds and AP.deadIds[t.id] and now-AP.deadIds[t.id]<10 then
+        LiveAction.target=nil; LiveAction.targetId=nil; t=nil
+    end
     if t and t.id then
         if TCS and TCS.id~=t.id and not TCS.deathHandled then
             local ev=deathEvidence(TCS,now)
@@ -7291,9 +7500,10 @@ local rawTargetRoot=CTX["rawTargetRoot"]
 -- DEFENSE releases the movers so CombatEvolution dodges are not cancelled by BodyVelocity.
 local defaults={
     Enabled=true, FlyFarmFight=true,
-    HoverMode="ABOVE_BEHIND", FlyHeight=5.5, FlyBehindOffset=2.5, OrbitRadius=4.5, OrbitSpeed=1.6,
+    HoverMode="ABOVE_BEHIND", FlyHeight=5.5, HoverDistance=3.0, FlyBehindOffset=2.5, OrbitRadius=4.5, OrbitSpeed=1.6,
     FlySpeed=110, VerticalSpeed=70, PositionGain=9,
-    TurboM1=true, M1Interval=.09, HoldCombo=true, ComboLength=3,
+    -- v3.9: Adaptive M1 by default. CombatSpeed maps to internal parameters; CUSTOM uses the raw values below.
+    CombatSpeed="FAST", TurboM1=false, M1Version=2, M1Interval=.14, HoldCombo=true, ComboLength=3,
     AggressiveSkills=true, SkillInterval=.48, SkillCastLock=.45, SkillBackoff=8, ConservativeRetry=3,
     RecoveryDistance=40, RecoveryHeight=22, RecoveryStrafeSpeed=.35,
     KeepComboUnderHit=true,
@@ -7302,6 +7512,8 @@ local defaults={
 }
 Config.Default.CombatMobility=Util.deepCopy(defaults)
 local saved=RAVYN.Config.CombatMobility or {}
+-- Turbo M1 used to be ON by default (not a user choice) and is confirmed to flicker the menu → reset once
+if (tonumber(saved.M1Version) or 0)<2 then saved.TurboM1=false; saved.M1Version=2; if (tonumber(saved.M1Interval) or 0)<.12 then saved.M1Interval=.14 end end
 if saved.NoRagdoll==nil and saved.AntiRagdoll~=nil then saved.NoRagdoll=saved.AntiRagdoll end
 if saved.NoStun==nil and saved.AntiStun~=nil then saved.NoStun=saved.AntiStun end
 RAVYN.Config.CombatMobility=Util.deepMerge(defaults,saved)
@@ -7315,6 +7527,15 @@ local M={flightActive=false,hoverState="STANDBY",lastAction="READY",
 RAVYN.CombatMobility=M
 local function cfg() return RAVYN.Config.CombatMobility end
 local function clamp(x,a,b) return math.max(a,math.min(b,x)) end
+-- Combat Speed → internal parameters (normal users never see the raw values)
+local SPEED={SAFE={m1=.18,skill=.8,combo=3},FAST={m1=.14,skill=.5,combo=3},MAX={m1=.12,skill=.35,combo=2}}
+local function params()
+    local c=cfg(); local sp=SPEED[c.CombatSpeed]
+    if not sp then return {m1=math.max(.05,tonumber(c.M1Interval) or .14),skill=math.max(.25,tonumber(c.SkillInterval) or .48),combo=math.max(1,tonumber(c.ComboLength) or 3)} end
+    local m1=sp.m1; if c.TurboM1 then m1=.09 end -- experimental, developer only
+    return {m1=m1,skill=sp.skill,combo=sp.combo}
+end
+M.params=params
 local function owner() local MO=RAVYN.MoveOwner; return MO and MO.current or "IDLE" end
 
 local function destroyMover()
@@ -7352,6 +7573,7 @@ local function hoverPoint(target,now,dt)
             local root=liveRoot(); local away=root and Vector3.new(root.Position.X-tp.X,0,root.Position.Z-tp.Z) or Vector3.zero
             if away.Magnitude<1 then away=-flatLook end
             M.escapeDir=away.Unit; M.escapeAngle=0; M.recoveryStartedAt=now
+            RAVYN.Logger:log("WARN","RECOVERY_STARTED · escaping",{})
         end
         M.escapeAngle=M.escapeAngle+c.RecoveryStrafeSpeed*dt -- slow strafe along the escape radius
         local ca,sa=math.cos(M.escapeAngle),math.sin(M.escapeAngle)
@@ -7364,9 +7586,11 @@ local function hoverPoint(target,now,dt)
     if c.HoverMode=="ABOVE" then return tp+Vector3.new(0,h,0),tp end
     if c.HoverMode=="ORBIT_HOVER" then
         M.orbitAngle=(M.orbitAngle+(c.OrbitSpeed*dt))%(math.pi*2)
-        return tp+Vector3.new(math.cos(M.orbitAngle)*c.OrbitRadius,h,math.sin(M.orbitAngle)*c.OrbitRadius),tp
+        local rad=tonumber(c.HoverDistance) or c.OrbitRadius
+        return tp+Vector3.new(math.cos(M.orbitAngle)*rad,h,math.sin(M.orbitAngle)*rad),tp
     end
-    return tp-flatLook*c.FlyBehindOffset+Vector3.new(0,h,0),tp
+    local behind=tonumber(c.HoverDistance) or c.FlyBehindOffset
+    return tp-flatLook*behind+Vector3.new(0,h,0),tp
 end
 local lastFlight=os.clock()
 local function flightStep()
@@ -7461,7 +7685,6 @@ local function mitigate(now)
 end
 
 -- ---------------- single combat executor (v3.8.4.2: verified skills + input arbiter) ----------------
-local pressKey=CTX["pressKey"]
 local faceCurrentTarget=CTX["faceCurrentTarget"]
 local function defenseActive(now)
     local E=RAVYN.CombatEvolution
@@ -7543,12 +7766,26 @@ local function pickSkill(target,dist,now)
     end
     return best,why
 end
+-- v1.2.2: bus rejections that are transient (the previous action is still resolving) vs. ones that describe a capability
+local TRANSIENT={ACTION_LOCK=true,COOLDOWN=true,PREVIOUS_ACTION_RUNNING=true,DEFENSE_ACTIVE=true,GUARD_HELD=true}
+M.TRANSIENT=TRANSIENT
 local function sendSkill(k,target,dist,now)
-    local s=stat(k.key); s.attempts=s.attempts+1; M.skillAttempts=M.skillAttempts+1
+    local s=stat(k.key)
     pcall(function() if faceCurrentTarget then faceCurrentTarget(target) end end)
     local sigBefore=slotSignature(k.index); local tracksBefore=animSet()
-    local ok,src=pressKey(k.key); LiveAction.lastInputSource=src
-    if not ok then s.lastFail=tostring(src); M.skillFailReason="INPUT_UNAVAILABLE"; return false end
+    -- the hotbar key is an identifier; the CombatActionBus resolves and executes (or refuses) the skill
+    local B=RAVYN.CombatActionBus
+    local r=B and B:RequestSkill(k,target,{source="CombatMobility"}) or result(false,"COMBAT_BUS_UNAVAILABLE")
+    LiveAction.lastInputSource=(r.value and r.value.backend) or r.code
+    if not r.ok then
+        if TRANSIENT[r.code] then return false end
+        s.attempts=s.attempts+1; M.skillAttempts=M.skillAttempts+1
+        s.lastFail=tostring(r.code); M.skillFailReason=r.code
+        s.backoffUntil=math.max(s.backoffUntil or 0,now+2) -- capability refusal: rest this key, M1 continues
+        return false
+    end
+    s.attempts=s.attempts+1; M.skillAttempts=M.skillAttempts+1
+    M.lastSkillBackend=r.value and r.value.backend
     s.sent=s.sent+1; s.lastSentAt=now; M.skillSent=M.skillSent+1; M.skillCount=M.skillSent
     M.lastSkillKey=k.key; M.lastSkillAt=now; M.skillFailReason="INPUT_SENT"; M.comboStage=0
     M.inputLockUntil=now+cfg().SkillCastLock
@@ -7577,6 +7814,7 @@ local function verifyStep(now)
     if not evidence and dmg>0 and now-p.at<=cfg().SkillCastLock+.3 then evidence="TARGET_HP" end
     if evidence then
         s.verified=s.verified+1; s.consecFail=0; s.lastVerifiedAt=p.at; s.lastFail=nil; s.lastEvidence=evidence
+        if s.verified==1 then RAVYN.Logger:log("INFO","SKILL_VERIFIED_"..p.key.." · "..evidence,{}) end -- first verification per key only
         M.skillVerified=M.skillVerified+1; M.skillFailReason="OK"; M.lastAction="SKILL "..p.key.." · VERIFIED"
         s.minRange=math.min(s.minRange or p.dist,p.dist); s.maxRange=math.max(s.maxRange or p.dist,p.dist)
         if dmg>0 then s.dmg=s.dmgSamples==0 and dmg or (s.dmg*.7+dmg*.3); s.dmgSamples=s.dmgSamples+1 end
@@ -7609,6 +7847,13 @@ local function combatStep(now)
     local c=cfg(); local target=LiveAction.target
     verifyStep(now)
     if not target or not c.Enabled or not RAVYN.FSM or RAVYN.FSM.state~="RUNNING" then M.combatState="IDLE"; M.nextAction="—"; return end
+    -- InstaKillAdapter (Threshold 99): while a finisher is armed or being verified, normal combat sends nothing (the bus refuses it too)
+    local IKA=RAVYN.InstaKillAdapter
+    -- checked before EVERY attack decision, so a target sitting at ≤1% is never hit by a normal action first
+    if IKA and (IKA.locked or (IKA.preAttack and IKA.preAttack(target,now))) then
+        M.combatState="FINISHER"; M.nextAction=(IKA.session and IKA.session.phase=="VERIFY") and "VERIFY KILL" or "FINISHER ARMED"; M.skillFailReason="FINISHER_LOCK"
+        return
+    end
     local o=owner()
     if Brain.forceEvade and Brain.emergency384 then M.combatState="RECOVERY"; M.nextAction="ESCAPE"; M.skillFailReason="EMERGENCY · COMBAT PAUSED"; return end
     if defenseActive(now) then M.combatState="DEFENSE_INTERRUPT"; M.nextAction="DEFENSE"; M.skillFailReason="DEFENSE_ACTIVE"; return end
@@ -7620,7 +7865,8 @@ local function combatStep(now)
     if M.pending and now<M.inputLockUntil then M.combatState="SKILL_CAST"; M.nextAction="WAIT CAST"; return end
     local pct=(target.health and target.maxHealth and target.maxHealth>0) and target.health/target.maxHealth*100 or 100
     -- skills
-    local atDecision=(not c.HoldCombo) or M.comboStage>=math.max(1,c.ComboLength) or not RAVYN.Config.Combat.AutoAttack
+    local pp=params()
+    local atDecision=(not c.HoldCombo) or M.comboStage>=pp.combo or not RAVYN.Config.Combat.AutoAttack
     local nextSkill=nil
     if RAVYN.Config.Combat.AutoAbilities then
         local keys=refreshKeys(now)
@@ -7630,7 +7876,7 @@ local function combatStep(now)
                 M.lastNoKeyAt=now; M.skillAttempts=M.skillAttempts+1
                 M.skillFailReason=M.everHadKeys and "SKILL_HOTBAR_NOT_READY" or "HOTBAR_KEYS_UNRESOLVED"
             end
-        elseif not M.pending and now-(LiveAction.lastSkill or 0)>=math.max(.25,c.SkillInterval) then
+        elseif not M.pending and now-(LiveAction.lastSkill or 0)>=pp.skill then
             local k,why=pickSkill(target,dist,now); nextSkill=k
             if k and atDecision and dist<=math.max(skillRange,(stat(k.key).maxRange or 0)+2) then
                 if sendSkill(k,target,dist,now) then M.combatState=(pct<=25) and "FINISHER" or "SKILL_CAST"; M.nextAction="VERIFY "..k.key; return end
@@ -7639,14 +7885,27 @@ local function combatStep(now)
     end
     M.nextAction=(nextSkill and atDecision) and ("SKILL "..nextSkill.key) or "M1"
     -- M1 (blocked while a skill cast lock is active)
-    if c.TurboM1 and RAVYN.Config.Combat.AutoAttack and dist<=m1Range and now>=M.inputLockUntil and now-(LiveAction.lastAttack or 0)>=math.max(.05,c.M1Interval) then
-        M.m1Attempts=M.m1Attempts+1
+    -- Adaptive M1: fast, but only as fast as useful. Damage evidence = target HP dropping.
+    if target.id~=M.hpTargetId then M.hpTargetId=target.id; M.hpLast=target.health; M.lastDamageAt=now; M.inRangeSince=nil end
+    if target.health and M.hpLast and target.health<M.hpLast then M.lastDamageAt=now end
+    M.hpLast=target.health
+    local interval=pp.m1
+    if dist<=m1Range then
+        M.inRangeSince=M.inRangeSince or now
+        if now-M.inRangeSince>2 and now-(M.lastDamageAt or now)>2 then interval=pp.m1*1.6; M.m1Adaptive="NOT_LANDING · SLOWED" else M.m1Adaptive="LANDING" end
+    else M.inRangeSince=nil; M.m1Adaptive="OUT_OF_RANGE" end
+    M.m1Interval=interval
+    if RAVYN.Config.Combat.AutoAttack and dist<=m1Range and now>=M.inputLockUntil and now-(LiveAction.lastAttack or 0)>=interval then
         local ok,r=pcall(function() return RAVYN:ClientAttack() end)
         if ok and r and r.ok then
+            M.m1Attempts=M.m1Attempts+1
             LiveAction.lastAttack=now; Brain.combo.m1=(Brain.combo.m1 or 0)+1; Brain.combo.lastAction="M1"
-            M.m1Sent=M.m1Sent+1; M.m1Count=M.m1Sent; M.comboStage=M.comboStage+1
+            M.m1Sent=M.m1Sent+1; M.m1Count=M.m1Sent; M.comboStage=M.comboStage+1; M.m1Blocked=nil
             M.lastAction=string.format("M1 ×%d",M.comboStage); M.combatState=(pct<=25) and "FINISHER" or "M1_CHAIN"
-            if M.comboStage>math.max(1,c.ComboLength)*3 then M.comboStage=math.max(1,c.ComboLength) end
+            if M.comboStage>pp.combo*3 then M.comboStage=pp.combo end
+        elseif ok and r and not TRANSIENT[r.code] then
+            -- refused (e.g. SILENT with no verified attack action): nothing was sent; retry at the normal cadence only
+            M.m1Attempts=M.m1Attempts+1; LiveAction.lastAttack=now; M.m1Blocked=r.code; M.lastAction="M1 · "..tostring(r.code)
         end
     elseif dist>m1Range then M.combatState="HOVER_LOCK" end
 end
@@ -7654,8 +7913,7 @@ end
 local baseProfile=Hooks.activeProfile
 Hooks.activeProfile=function()
     local p=baseProfile(); local c=cfg()
-    if c.Enabled and c.TurboM1 then p.attackCooldown=math.min(p.attackCooldown or .4,math.max(.05,tonumber(c.M1Interval) or .09)) end
-    if c.Enabled and c.AggressiveSkills then p.skillDelay=math.min(p.skillDelay or 1,math.max(.25,tonumber(c.SkillInterval) or .48)) end
+    if c.Enabled then local pp=params(); p.attackCooldown=math.min(p.attackCooldown or .4,pp.m1); p.skillDelay=math.min(p.skillDelay or 1,pp.skill) end
     return p
 end
 
@@ -7803,7 +8061,7 @@ local function playerSnapshot()
         local tool=char:FindFirstChildOfClass("Tool"); out.equipped=tool and tool.Name or nil
     end
     local bp=LP:FindFirstChildOfClass("Backpack")
-    if bp then for _,t in ipairs(bp:GetChildren()) do table.insert(out.tools,t.Name) end end
+    if bp then for _,t in ipairs(bp:GetChildren()) do table.insert(out.tools,t.Name) end; table.sort(out.tools) end -- GetChildren order is not semantic
     local ok,desc=pcall(function() return LP:GetDescendants() end)
     if ok then
         local n=0
@@ -7822,7 +8080,35 @@ local function playerSnapshot()
     end
     return out
 end
-PR.guiSnapshot=guiSnapshot; PR.worldSnapshot=worldSnapshot; PR.playerSnapshot=playerSnapshot
+-- global marker snapshot: BillboardGui / Highlight / Beam anywhere, with WORLD position (never screen/minimap)
+local function markerWorldPos(inst)
+    local a=inst:IsA("BillboardGui") and (inst.Adornee or inst.Parent) or (inst:IsA("Highlight") and (inst.Adornee or inst.Parent)) or nil
+    if inst:IsA("Beam") then local at=inst.Attachment1 or inst.Attachment0; return at and at.WorldPosition or nil,at end
+    if a and a:IsA("BasePart") then return a.Position,a end
+    if a and a:IsA("Attachment") then return a.WorldPosition,a end
+    if a and a:IsA("Model") then local ok,cf=pcall(function() return a:GetPivot() end); if ok then return cf.Position,a end end
+    return nil,a
+end
+local function globalMarkers()
+    local out={}; local n=0; local own=RAVYN._gui
+    local function take(d)
+        if n>=250 then return end
+        if not (d:IsA("BillboardGui") or d:IsA("Highlight") or d:IsA("Beam")) then return end
+        if own and d:IsDescendantOf(own) then return end
+        local pos,ad=markerWorldPos(d)
+        local txt={}
+        if d:IsA("BillboardGui") then for _,y in ipairs(d:GetDescendants()) do if (y:IsA("TextLabel") or y:IsA("TextButton")) and y.Text~="" then table.insert(txt,short(y.Text,30)) end end end
+        n=n+1
+        out[d:GetFullName()]=d.ClassName..(pos and string.format(" @(%.0f,%.0f,%.0f)",pos.X,pos.Y,pos.Z) or " @(no world pos)")
+            ..(ad and (" adornee "..ad:GetFullName()) or "")..(#txt>0 and (" '"..table.concat(txt," | ").."'") or "")
+    end
+    local pg=LP and LP:FindFirstChildOfClass("PlayerGui")
+    if pg then for _,d in ipairs(pg:GetDescendants()) do take(d) end end
+    local ok,desc=pcall(function() return workspace:GetDescendants() end)
+    if ok then for i,d in ipairs(desc) do if i>25000 then break end; take(d) end end
+    return out
+end
+PR.guiSnapshot=guiSnapshot; PR.worldSnapshot=worldSnapshot; PR.playerSnapshot=playerSnapshot; PR.globalMarkers=globalMarkers
 
 -- ---------- diff ----------
 local function diffMaps(a,b,fmt)
@@ -7868,27 +8154,33 @@ local function startHooks(rec)
     end))
     local pg=LP and LP:FindFirstChildOfClass("PlayerGui")
     if pg then
-        local own=RAVYN._gui; local n=0
-        for _,d in ipairs(pg:GetDescendants()) do
-            if n>=700 then break end
-            if d:IsA("GuiButton") and not (own and d:IsDescendantOf(own)) then
-                n=n+1
-                table.insert(rec.conns,d.Activated:Connect(function()
-                    rec.buttons=rec.buttons or {}
-                    local txt=d:IsA("TextButton") and d.Text or ""
-                    local lbl=d:FindFirstChildWhichIsA("TextLabel",true)
-                    table.insert(rec.buttons,{path=d:GetFullName(),text=short(txt~="" and txt or (lbl and lbl.Text) or "",60)})
-                    ev("BUTTON "..d:GetFullName().." '"..short(txt~="" and txt or (lbl and lbl.Text) or "",40).."'")
-                end))
-            end
+        local own=RAVYN._gui
+        rec.hooked={}; rec.hookCount=0
+        local function hook(d)
+            if rec.hookCount>=1500 or rec.hooked[d] or not d:IsA("GuiButton") or (own and d:IsDescendantOf(own)) then return end
+            rec.hooked[d]=true; rec.hookCount=rec.hookCount+1
+            table.insert(rec.conns,d.Activated:Connect(function()
+                rec.buttons=rec.buttons or {}
+                local txt=d:IsA("TextButton") and d.Text or ""
+                local lbl=d:FindFirstChildWhichIsA("TextLabel",true)
+                table.insert(rec.buttons,{path=d:GetFullName(),text=short(txt~="" and txt or (lbl and lbl.Text) or "",60)})
+                ev("BUTTON "..d:GetFullName().." '"..short(txt~="" and txt or (lbl and lbl.Text) or "",40).."'")
+            end))
         end
+        for _,d in ipairs(pg:GetDescendants()) do hook(d) end
+        -- menus created after Start (e.g. a mission list) fire DescendantAdded for every nested descendant
+        table.insert(rec.conns,pg.DescendantAdded:Connect(function(d)
+            if not PR.recording or PR.recording~=rec then return end
+            if d:IsA("GuiButton") then hook(d); ev("GUI ADDED "..d:GetFullName()) end
+        end))
     end
 end
 function RAVYN:LearnActionBegin(label,system)
     if PR.recording then return result(false,"ALREADY_RECORDING") end
     local g,gn=guiSnapshot()
-    PR.recording={label=tostring(label or "Custom action"),system=system or "OTHER",at=os.clock(),clock=os.date("%H:%M:%S"),
-        gui=g,guiCount=gn,world=worldSnapshot(80),player=playerSnapshot(),conns={}}
+    PR.seq=(PR.seq or 0)+1
+    PR.recording={label=tostring(label or "Custom action"),system=system or "OTHER",at=os.clock(),clock=os.date("%H:%M:%S"),seq=PR.seq,
+        gui=g,guiCount=gn,world=worldSnapshot(80),markers=globalMarkers(),player=playerSnapshot(),conns={}}
     startHooks(PR.recording)
     RAVYN.Logger:log("INFO","LEARN_ACTION_BEGIN",{label=PR.recording.label})
     return result(true,"RECORDING",{label=PR.recording.label,guiNodes=gn})
@@ -7897,7 +8189,7 @@ function RAVYN:LearnActionEnd()
     local rec=PR.recording; if not rec then return result(false,"NOT_RECORDING") end
     PR.recording=nil; stopHooks(rec)
     local g2=guiSnapshot(); local w2=worldSnapshot(80); local p2=playerSnapshot()
-    local lines={string.format("LEARN ACTION · %s · system %s · %s → %s · %.1fs",rec.label,rec.system,rec.clock,os.date("%H:%M:%S"),os.clock()-rec.at),
+    local lines={string.format("LEARN ACTION #%03d · %s · system %s · %s → %s · %.1fs",rec.seq,rec.label,rec.system,rec.clock,os.date("%H:%M:%S"),os.clock()-rec.at),
         "status: EVIDENCE ONLY (not verified)"}
     -- interaction candidate + confidence
     local cand,conf="NONE OBSERVED","LOW"
@@ -7917,6 +8209,8 @@ function RAVYN:LearnActionEnd()
     push(lines,"prompts added",pa,15); push(lines,"prompts removed",prm,15); push(lines,"prompts changed",pc,15)
     local ma,mr,mc=diffMaps(rec.world.markers,w2.markers,kvFmt)
     push(lines,"markers added",ma,10); push(lines,"markers removed",mr,10); push(lines,"markers changed",mc,10)
+    local gma,gmr,gmc=diffMaps(rec.markers or {},globalMarkers(),kvFmt)
+    push(lines,"global markers added (world pos)",gma,15); push(lines,"global markers removed",gmr,15); push(lines,"global markers changed",gmc,15)
     local ta,tr=diffMaps(rec.world.top,w2.top,kvFmt)
     push(lines,"workspace children added",ta,10); push(lines,"workspace children removed",tr,10)
     local aa,ar,ac=diffMaps(rec.player.attrs,p2.attrs,kvFmt)
@@ -7928,8 +8222,8 @@ function RAVYN:LearnActionEnd()
     if tostring(rec.player.level)~=tostring(p2.level) or tostring(rec.player.xp)~=tostring(p2.xp) then
         table.insert(lines,"level/xp: "..tostring(rec.player.level).."/"..tostring(rec.player.xp).." → "..tostring(p2.level).."/"..tostring(p2.xp)) end
     local text=table.concat(lines,"\n")
-    local evidence={actionName=rec.label,system=rec.system,at=os.clock(),clock=rec.clock,interactionCandidate=cand,confidence=conf,
-        guiChanges=#ga+#gr+#gc,worldChanges=#wa+#wr,valueChanges=#va+#vr+#vc,text=text}
+    local evidence={actionName=rec.label,system=rec.system,at=os.clock(),clock=rec.clock,seq=rec.seq,interactionCandidate=cand,confidence=conf,
+        guiChanges=#ga+#gr+#gc,worldChanges=#wa+#wr+#gma+#gmr+#gmc,valueChanges=#va+#vr+#vc,text=text}
     table.insert(PR.records,evidence); while #PR.records>12 do table.remove(PR.records,1) end
     PR.lastReport=text; PR.captures=PR.captures+1
     local GK=RAVYN.GameKnowledge; if GK and GK.recordEvidence then pcall(GK.recordEvidence,evidence) end
@@ -7938,21 +8232,30 @@ function RAVYN:LearnActionEnd()
         if mf and isf and not isf("RAVYN") then mf("RAVYN") end
         if mf and isf and not isf("RAVYN/Probes") then mf("RAVYN/Probes") end
         local safe=string.gsub(rec.label,"[^%w]+","_")
-        wf("RAVYN/Probes/"..os.date("%Y%m%d_%H%M%S").."_"..safe..".txt",text)
+        wf("RAVYN/Probes/"..os.date("%Y%m%d_%H%M%S").."_"..string.format("%03d",rec.seq).."_"..safe..".txt",text)
         evidence.file=true
     end) end
     RAVYN.Logger:log("INFO","LEARN_ACTION_END",{label=rec.label,candidate=cand,confidence=conf})
     return result(true,"ACTION_EVIDENCE",evidence)
 end
-function RAVYN:CancelLearnAction() local rec=PR.recording; if rec then stopHooks(rec); PR.recording=nil end; return result(true,"CANCELLED") end
+local function cancelRecording(reason)
+    local rec=PR.recording; if not rec then return false end
+    stopHooks(rec); PR.recording=nil
+    PR.lastCancelled={label=rec.label,seq=rec.seq,reason=reason,at=os.clock()}
+    RAVYN.Logger:log("INFO","LEARN_ACTION_CANCELLED",{label=rec.label,reason=reason})
+    return true
+end
+function RAVYN:CancelLearnAction() cancelRecording("USER"); return result(true,"CANCELLED") end
 function RAVYN:CopyLearnActionReport()
     local f=exec("setclipboard"); if not PR.lastReport then return result(false,"NO_ACTION_EVIDENCE") end
     if not f then return result(false,"SETCLIPBOARD_UNAVAILABLE") end
     pcall(f,PR.lastReport); return result(true,"ACTION_EVIDENCE_COPIED")
 end
--- a recording is user-driven and intentionally survives Stop; Destroy ends it
+-- Stop Everything stops EVERYTHING temporary: an in-progress recording is cancelled and not saved
+local baseStop=RAVYN.Stop
+function RAVYN:Stop() cancelRecording("STOP"); return baseStop(self) end
 local baseDestroy=RAVYN.Destroy
-function RAVYN:Destroy() if PR.recording then stopHooks(PR.recording); PR.recording=nil end; return baseDestroy(self) end
+function RAVYN:Destroy() cancelRecording("DESTROY"); return baseDestroy(self) end
 CTX["Probe385"]=PR
 RAVYN.Logger:log("INFO","PROBE_FRAMEWORK_V385_READY")
 return true]==========]); if not ok then return end end
@@ -8016,6 +8319,46 @@ sys("SKILL_TREE","Skill tree / mastery",{status="UNRESOLVED",entry="REFERENCE",s
     completion="UNRESOLVED",paths="none verified",unknown="points, unlock action"})
 sys("OTHER","Other / custom",{status="UNRESOLVED",entry="—",start="—",objectives="—",progress="—",completion="—",paths="—",unknown="—"})
 
+-- ================= capability provider (v3.8.5.1 · single source of truth) =================
+-- UI (Auto Play, Quests, Research, Diagnostics) and runtime gates read ONLY this table.
+-- Status vocabulary: VERIFIED · PARTIAL · AWAITING_LIVE · UNRESOLVED · RESEARCH_REQUIRED · DISABLED.
+-- A status is raised to VERIFIED only by explicit live evidence (GK.markVerified), never by implementation.
+GK.capabilities={}; GK.capOrder={}
+local function cap(key,title,status,evidence,detail)
+    GK.capabilities[key]={key=key,title=title,status=status,evidence=evidence,detail=detail}; table.insert(GK.capOrder,key)
+end
+cap("HOTBAR_KEYS","Hotbar key discovery","VERIFIED","Binding report: SkillsHolder.<n>-Skill.<Skills_nth>.KeyLabel = F Z X C V B","KeyLabel promotion")
+cap("SKILL_EXECUTION","Skill execution","AWAITING_LIVE","v3.8.4.1 live: skills 0/738 (pre-fix)","verified-cast tracking since v3.8.4.2")
+cap("COOLDOWN_LEARNING","Skill cooldown learning","AWAITING_LIVE","none","slot GUI returns to pre-cast signature")
+cap("M1_INPUT","M1 input","PARTIAL","v3.8.4.1 live: M1 409 inputs sent (hits not verified)","")
+cap("TRAVEL","Travel / teleport / noclip","AWAITING_LIVE","none reported","")
+cap("COMBAT_HOVER","Combat hover","PARTIAL","v3.8.4.1 live: hover above Nezura observed","")
+cap("RECOVERY_ESCAPE","Recovery escape","AWAITING_LIVE","v3.8.4.1 live: height-only recovery died (pre-fix)","")
+cap("BOSS_DEATH_HANDOFF","Boss death → loot handoff","AWAITING_LIVE","v3.8.4.2 live: session never started (pre-fix)","TargetCombatSession since v3.8.4.3")
+cap("BOSS_CHEST_OPEN","Boss chest open","UNRESOLVED","BossInfo.Chest identity only; interaction unobserved","")
+cap("DROP_COLLECTION","Drop collection","AWAITING_LIVE","v3.8.4.2 live: drops left on ground (pre-fix)","")
+cap("MENU_STABILITY","Menu stability in combat","AWAITING_LIVE","v3.8.4.2 live: flicker (pre-fix)","")
+cap("QUEST_PROMPT","Quest accept/turn-in via prompt","PARTIAL","none reported","AdaptiveIntel fireproximityprompt + text signature")
+cap("QUEST_READ","Quest tracker semantics","UNRESOLVED","zQuestsFrame / QuestionStrip paths only","QuestProbe capturing")
+cap("CROW_MISSION","Crow automation","RESEARCH_REQUIRED","none","record the Crow lifecycle with Learn action")
+cap("MUZAN_HUNT","Muzan automation","RESEARCH_REQUIRED","none","record the Muzan task flow with Learn action")
+cap("BREATHING","Breathing / training","RESEARCH_REQUIRED","none","")
+cap("DUNGEON","Ouwigahara","RESEARCH_REQUIRED","none","")
+cap("PERFECT_PARRY","Perfect parry","UNRESOLVED","parry input unverified","")
+cap("EQUIP","Weapon equip","UNRESOLVED","none","")
+cap("NIGHT_CONDITION","Day/night condition","UNRESOLVED","OnlyAtNight metadata only","")
+cap("LEARN_ACTION","Learn action probe","AWAITING_LIVE","none","")
+function GK.capability(key) return GK.capabilities[key] end
+function GK.capable(key) local c=GK.capabilities[key]; return c~=nil and c.status=="VERIFIED" end
+-- explicit, evidence-backed promotion only (e.g. after a live test the user confirms)
+function GK.markVerified(key,evidence)
+    local c=GK.capabilities[key]; if not c then return false end
+    c.status="VERIFIED"; c.evidence=tostring(evidence or c.evidence); return true
+end
+function GK.statusLabel(s)
+    return (s=="AWAITING_LIVE" and "PARTIAL · AWAITING LIVE") or (s=="RESEARCH_REQUIRED" and "RESEARCH REQUIRED") or s
+end
+
 function GK.recordEvidence(ev)
     table.insert(GK.evidence,ev); while #GK.evidence>30 do table.remove(GK.evidence,1) end
     local s=GK.systems[ev.system] or GK.systems.OTHER
@@ -8074,7 +8417,7 @@ local function markerPos(bb)
 end
 function GK.scanMarkers(force)
     local now=os.clock()
-    if not force and now-GK.markersAt<3 then return GK.markers end
+    if not force and now-GK.markersAt<8 then return GK.markers end -- v3.9: full scan ≤ every 8s, only while a target is unresolved
     GK.markersAt=now
     local out={}
     local function take(bb)
@@ -8133,6 +8476,9 @@ function RAVYN:GetResearchReport()
         "  candidates (not interpreted):"}
     for _,c in ipairs(P.candidates) do table.insert(lines,"    "..c.path.." = "..c.value) end
     table.insert(lines,"WORLD CONDITION: "..W.state.."  ·  "..W.candidate); table.insert(lines,"")
+    table.insert(lines,"CAPABILITIES")
+    for _,k in ipairs(GK.capOrder) do local c=GK.capabilities[k]; table.insert(lines,string.format("  %-22s %-24s %s",k,GK.statusLabel(c.status),c.evidence)) end
+    table.insert(lines,"")
     table.insert(lines,"GAME SYSTEMS")
     for _,k in ipairs(GK.order) do
         local s=GK.systems[k]
@@ -8153,6 +8499,4911 @@ end
 CTX["GK385"]=GK
 RAVYN.Logger:log("INFO","GAME_KNOWLEDGE_V385_READY")
 return true]==========]); if not ok then return end end
+do local ok=runChunk("GoV390.lua",[==========[local G=(getgenv and getgenv()) or _G
+local CTX=G.__RAVYN_CTX
+local Util=CTX["Util"]
+local Config=CTX["Config"]
+local result=CTX["result"]
+local RAVYN=CTX["RAVYN"]
+local LiveAction=CTX["LiveAction"]
+-- v3.9 RAVYN GO: one button, one goal. A runtime profile turns on what the goal needs WITHOUT rewriting the
+-- user's saved toggles (SaveSettings writes the originals while the profile is active). The scheduler still
+-- decides what runs; nothing new is invented.
+local defaults={Goal="AUTO_PROGRESS"}
+Config.Default.Go=Util.deepCopy(defaults)
+RAVYN.Config.Go=Util.deepMerge(defaults,RAVYN.Config.Go or {})
+
+-- Performance budget (v3.9): AdaptiveIntel read its quest GUI every 0.35s; ~2 Hz is enough.
+if RAVYN.Config.AdaptiveIntel and (tonumber(RAVYN.Config.AdaptiveIntel.QuestScanInterval) or 0)<.5 then RAVYN.Config.AdaptiveIntel.QuestScanInterval=.5 end
+RAVYN.PerfBudget={combat="30 Hz while a target exists",movement="20 Hz while moving",ui="4 Hz visible page only · 1 Hz hidden",
+    questGui="2 Hz",npcScan="snapshot 3 Hz (cached)",workspaceScan="never continuous: source scan ≤ 1/8s only while acquiring; markers ≤ 1/8s only while unresolved",
+    research="only while recording",loot="only during a loot session",promptSearch="sphere query ≤ 4 Hz"}
+
+-- goal → profile (config path → runtime value). Availability comes from the capability provider.
+local GOALS={
+    AUTO_PROGRESS={title="Auto Progress",mode="Smart",profile={["QuestBrain.AutoQuest"]=true,["CrowDirect.Enabled"]=true,["AutoPlayV38.PreFarm"]=true,["AutoPlayV38.BossRotation"]=true}},
+    BOSS_FARM={title="Boss Farm",mode="Bosses",profile={["QuestBrain.AutoQuest"]=false,["AutoPlayV38.BossRotation"]=true}},
+    QUESTS={title="Quests",mode="Smart",profile={["QuestBrain.AutoQuest"]=true,["CrowDirect.Enabled"]=true,["AutoPlayV38.PreFarm"]=false}},
+    BREATHING={title="Breathing",capability="BREATHING"},
+    DUNGEON={title="Dungeon",capability="DUNGEON"},
+    MONEY={title="Money / resources",capability="MONEY"},
+}
+local GOAL_ORDER={"AUTO_PROGRESS","BOSS_FARM","QUESTS","BREATHING","DUNGEON","MONEY"}
+local COMMON={["Combat.AutoAttack"]=true,["Combat.AutoAbilities"]=true,["CombatMobility.Enabled"]=true,["CombatMobility.FlyFarmFight"]=true,
+    ["TravelController.Enabled"]=true,["Loot384.AutoLootAfterKill"]=true,["Loot384.AutoLootChests"]=true}
+local GO={active=false,paused=false,goal=nil,startedAt=0,saved={},applying=false,goals=GOALS,order=GOAL_ORDER}
+RAVYN.GoState=GO
+
+local function getPath(path) local node=RAVYN.Config; for part in string.gmatch(path,"[^%.]+") do if type(node)~="table" then return nil end; node=node[part] end; return node end
+local function setPath(path,v)
+    local node=RAVYN.Config; local parts={}; for part in string.gmatch(path,"[^%.]+") do table.insert(parts,part) end
+    for i=1,#parts-1 do node=node[parts[i]]; if type(node)~="table" then return false end end
+    node[parts[#parts]]=v; return true
+end
+function GO.available(goal)
+    local g=GOALS[goal]; if not g then return false,"UNKNOWN_GOAL" end
+    if g.capability then
+        local GK=RAVYN.GameKnowledge
+        if not (GK and GK.capable(g.capability)) then return false,"RESEARCH_REQUIRED" end
+    end
+    return true
+end
+local function applyProfile(goal)
+    local g=GOALS[goal]; local values={}
+    for k,v in pairs(COMMON) do values[k]=v end
+    for k,v in pairs(g.profile or {}) do values[k]=v end
+    values["AutoPlayV38.Mode"]=g.mode or "Smart"
+    GO.applying=true
+    for path,v in pairs(values) do
+        if GO.saved[path]==nil then local cur=getPath(path); GO.saved[path]={value=cur} end
+        setPath(path,v)
+    end
+    if GO.saved["Intelligence.AutoPlay"]==nil then GO.saved["Intelligence.AutoPlay"]={value=getPath("Intelligence.AutoPlay")} end
+    local r=RAVYN:SetAutoPlay(true)
+    GO.applying=false
+    return r
+end
+local function restoreProfile()
+    GO.applying=true
+    for path,rec in pairs(GO.saved) do setPath(path,rec.value) end
+    GO.saved={}
+    GO.applying=false
+end
+function RAVYN:Go(goal)
+    goal=goal or self.Config.Go.Goal
+    local ok,why=GO.available(goal); if not ok then return result(false,why,{goal=goal}) end
+    if GO.active and GO.goal~=goal then restoreProfile() end
+    self.Config.Go.Goal=goal
+    GO.active=true; GO.paused=false; GO.goal=goal; GO.startedAt=os.clock()
+    if self.FSM.state=="PAUSED" then self:Resume() end
+    local r=applyProfile(goal)
+    if self.FSM.state=="STOPPED" then self:Start() end
+    self.Logger:log("INFO","GO_START",{goal=goal})
+    if self.AutoPlay384 and self.AutoPlay384.push then self.AutoPlay384.push("RAVYN started · "..GOALS[goal].title,"success") end
+    return result(true,"RAVYN_GO",{goal=goal,autoplay=r and r.code})
+end
+function RAVYN:GoPause()
+    if not GO.active then return result(false,"NOT_ACTIVE") end
+    if GO.paused then GO.paused=false; if self.FSM.state=="PAUSED" then self:Resume() end; return result(true,"RESUMED") end
+    GO.paused=true; if self.FSM.state=="RUNNING" then self:Pause() end
+    return result(true,"PAUSED")
+end
+function RAVYN:GoSetGoal(goal)
+    local ok,why=GO.available(goal); if not ok then return result(false,why,{goal=goal}) end
+    self.Config.Go.Goal=goal
+    if GO.active then return self:Go(goal) end
+    return self:SetConfig("Go.Goal",goal)
+end
+-- keep user's saved toggles untouched by the runtime profile
+local baseSave=RAVYN.SaveSettings
+function RAVYN:SaveSettings(...)
+    if not next(GO.saved) then return baseSave(self,...) end
+    local live={}
+    for path,rec in pairs(GO.saved) do live[path]=getPath(path); setPath(path,rec.value) end
+    local ok,r=pcall(baseSave,self,...)
+    for path,v in pairs(live) do setPath(path,v) end
+    if not ok then error(r) end
+    return r
+end
+-- a user change to a profile-managed setting while GO runs is a real choice: keep it as the saved value
+local baseSetConfig=RAVYN.SetConfig
+function RAVYN:SetConfig(path,value)
+    local r=baseSetConfig(self,path,value)
+    if r and r.ok and not GO.applying and GO.saved[path]~=nil then GO.saved[path]={value=value} end
+    return r
+end
+local baseStop=RAVYN.Stop
+function RAVYN:Stop()
+    local was=GO.active
+    GO.active=false; GO.paused=false
+    if next(GO.saved) then restoreProfile() end
+    local r=baseStop(self)
+    if was then task.defer(function() pcall(function() RAVYN:SaveSettings() end) end) end
+    return r
+end
+-- simple state for the UI: READY → STARTING → FINDING OBJECTIVE → ACTIVE (· PAUSED / STOPPED)
+function GO.state()
+    local fsm=RAVYN.FSM and RAVYN.FSM.state
+    if not GO.active then return fsm=="RUNNING" and "MANUAL" or "READY" end
+    if GO.paused or fsm=="PAUSED" then return "PAUSED" end
+    if os.clock()-GO.startedAt<1.2 then return "STARTING" end
+    local JS=RAVYN.JobScheduler; local LC=RAVYN.LootController
+    if LiveAction.target or (LC and LC.active) or (JS and JS.job~="IDLE") then return "ACTIVE" end
+    return "FINDING OBJECTIVE"
+end
+function RAVYN:GetGoStatus() return result(true,"GO_STATUS",{active=GO.active,paused=GO.paused,goal=GO.goal or self.Config.Go.Goal,state=GO.state()}) end
+CTX["GO390"]=GO
+RAVYN.Logger:log("INFO","RAVYN_GO_V390_READY")
+return true]==========]); if not ok then return end end
+do local ok=runChunk("RuntimeSchemaV391.lua",[==========[local G=(getgenv and getgenv()) or _G
+local CTX=G.__RAVYN_CTX
+local result=CTX["result"]
+local RAVYN=CTX["RAVYN"]
+-- v3.9.1 RuntimeSchema + read-only DataAdapters.
+-- Rules: never require() any ModuleScript (names only, code is never executed); never invoke command modules
+-- (e.g. OCIFolder Give/Damage/CompleteQuest…) — they are identity evidence only; never fire remotes;
+-- the current player's data is ONLY Player_Service.Data.<LocalPlayer.Name> (no fallback to other players).
+local RS=game:GetService("ReplicatedStorage")
+local Players=game:GetService("Players")
+local HttpService=game:GetService("HttpService")
+local LP=Players.LocalPlayer
+local SCH={builtAt=nil,nodes={},identities={},errors={}}
+RAVYN.RuntimeSchema=SCH
+
+local function path(root,...)
+    local cur=root
+    for _,name in ipairs({...}) do if not cur then return nil end; cur=cur:FindFirstChild(name) end
+    return cur
+end
+local function childNames(inst,limit)
+    local out={}; if not inst then return out end
+    for i,c in ipairs(inst:GetChildren()) do if i>(limit or 200) then break end; table.insert(out,c.Name) end
+    table.sort(out); return out
+end
+-- one-shot identity lookup in the world (C-side recursive FindFirstChild; never continuous)
+local function worldFind(name)
+    local ok,inst=pcall(function() return workspace:FindFirstChild(name,true) end)
+    if not ok or not inst then return nil end
+    local pos=nil
+    if inst:IsA("BasePart") then pos=inst.Position elseif inst:IsA("Model") then local okP,cf=pcall(function() return inst:GetPivot() end); if okP then pos=cf.Position end end
+    return {inst=inst,path=inst:GetFullName(),class=inst.ClassName,pos=pos}
+end
+
+-- ---------- LocalPlayerDataResolver + ActiveSlotResolver (v3.9.1.1) ----------
+-- Layout evidence: Player_Service.Data.<LocalPlayer.Name>.slots.<SlotX>.{Inventory,Toolbar,Powers,Quests,…}
+-- Local player only. No hard-coded slot. Without reliable evidence: ACTIVE_SLOT_UNRESOLVED.
+local SECTION_NAMES={Inventory=true,Toolbar=true,Powers=true,Quests=true,ItemLoadouts=true,MasteryProgressionList=true,SkillTreeUnlockedList=true}
+local SLOT_KEYS={"CurrentSlot","ActiveSlot","SelectedSlot","CurrentSave","ActiveSave","SelectedSave","Slot","SaveSlot"}
+local function hasSections(inst) if not inst then return 0 end; local n=0; for _,c in ipairs(inst:GetChildren()) do if SECTION_NAMES[c.Name] then n=n+1 end end; return n end
+local function slotFromValue(slots,v)
+    if v==nil or not slots then return nil end
+    local s=tostring(v)
+    return slots:FindFirstChild(s) or slots:FindFirstChild("Slot"..s) or slots:FindFirstChild("slot"..s) or nil
+end
+function SCH.resolveLocalData(root)
+    local R={status="PLAYER_DATA_NOT_FOUND",me=nil,layout=nil,slot=nil,source=nil,candidates={}}
+    if not (root and LP) then return R end
+    local me=root:FindFirstChild(LP.Name) -- local player only; never another player's node
+    if not me then return R end
+    R.me=me
+    local slots=me:FindFirstChild("slots") or me:FindFirstChild("Slots")
+    if not slots then
+        if hasSections(me)>0 then R.status="RESOLVED"; R.layout="DIRECT"; R.slot=me; R.source="SECTIONS_DIRECT_UNDER_PLAYER" else R.status="NO_SLOTS_OR_SECTIONS" end
+        return R
+    end
+    R.layout="SLOTS"
+    for _,c in ipairs(slots:GetChildren()) do
+        local attrs=c:GetAttributes(); local flag=nil
+        for _,k in ipairs({"Active","Selected","Current","IsActive","IsSelected","InUse"}) do if attrs[k]==true then flag=k end end
+        table.insert(R.candidates,{name=c.Name,sections=hasSections(c),flag=flag})
+    end
+    table.sort(R.candidates,function(a,b) return a.name<b.name end)
+    -- 1) explicit current/active slot value or attribute (player node, slots container, LocalPlayer)
+    for _,holder in ipairs({me,slots,LP}) do
+        for _,k in ipairs(SLOT_KEYS) do
+            local vObj=holder~=LP and holder:FindFirstChild(k)
+            local v=(vObj and vObj:IsA("ValueBase") and vObj.Value) or holder:GetAttribute(k)
+            local s=slotFromValue(slots,v)
+            if s then R.status="RESOLVED"; R.slot=s; R.source=(holder==LP and "LocalPlayer" or holder.Name).."."..k.."="..tostring(v); return R end
+        end
+    end
+    -- 2) a slot flagged active/selected by attribute
+    for _,c in ipairs(R.candidates) do if c.flag then R.status="RESOLVED"; R.slot=slots:FindFirstChild(c.name); R.source="attribute "..c.flag.." on "..c.name; return R end end
+    -- 3) only one slot exists → unambiguous
+    local withData={}; for _,c in ipairs(R.candidates) do if c.sections>0 then table.insert(withData,c) end end
+    if #R.candidates==1 then R.status="RESOLVED"; R.slot=slots:GetChildren()[1]; R.source="ONLY_SLOT"; return R end
+    R.status="ACTIVE_SLOT_UNRESOLVED"; R.withData=#withData
+    return R
+end
+
+-- ---------- schema build (on demand, cached) ----------
+local TRAINERS={"Flame","Thunder","Water","Wind","Stone","Serpent","Insect","Sound"}
+local WORLD_IDENTITIES={"Muzan","Refiner Hagane","Black Marketer","Harvester of Souls Zurinyz","Yeti Summon","Sealed Chest T1","Sealed Chest T2","Sealed Chest T3"}
+-- light build: containers + names only (cheap). full build adds one-shot world identity lookups (explicit only).
+function SCH.build(full)
+    local now=os.clock(); local N={}; local I={}
+    N.playerDataRoot=path(RS,"Player_Service","Data")
+    local R=SCH.resolveLocalData(N.playerDataRoot)
+    SCH.slot=R
+    N.playerData=R.me                                   -- local player node (whole, all local slots)
+    N.sectionRoot=(R.status=="RESOLVED") and R.slot or nil -- where Inventory/Quests/… live
+    N.questStates=path(RS,"QuestStates")
+    N.ouwlandContent=path(RS,"Ouwland","Content")
+    N.dialogueQuests=N.ouwlandContent and path(N.ouwlandContent,"Misc","NpcContents","Dialogues","Quests")
+    N.dialogueFunctions=N.ouwlandContent and path(N.ouwlandContent,"Misc","NpcContents","Dialogues","Functions")
+    N.dialogueYap=N.ouwlandContent and path(N.ouwlandContent,"Misc","NpcContents","Dialogues","Yap")
+    N.npcs=N.ouwlandContent and path(N.ouwlandContent,"Misc","Npcs")
+    N.skills=path(RS,"Skills")
+    N.training=workspace:FindFirstChild("Training")
+    N.humanoidRegions=path(workspace,"Humanoids","Regions")
+    N.debree=workspace:FindFirstChild("Debree")
+    local okO,oci=pcall(function() return RS:FindFirstChild("OCIFolder",true) end); N.ociFolder=okO and oci or nil
+    -- identities (names only)
+    I.questStates=childNames(N.questStates,400)
+    I.playerDataSections=N.sectionRoot and childNames(N.sectionRoot,60) or {}
+    I.crowBossHuntDialogues=childNames(N.dialogueQuests and N.dialogueQuests:FindFirstChild("Boss Hunts"),100)
+    I.crowBossHuntNpcs=childNames(N.npcs and N.npcs:FindFirstChild("Boss Hunts"),100)
+    I.crowBossHuntsFound=(N.dialogueQuests and N.dialogueQuests:FindFirstChild("Boss Hunts")~=nil) or (N.npcs and N.npcs:FindFirstChild("Boss Hunts")~=nil) or false
+    I.muzanQuestState=N.questStates and N.questStates:FindFirstChild("Muzan Quest")~=nil or false
+    I.muzanDialogue={actions=N.dialogueFunctions and N.dialogueFunctions:FindFirstChild("MuzanActions")~=nil or false,
+        quests=N.dialogueQuests and N.dialogueQuests:FindFirstChild("Muzan")~=nil or false,yap=N.dialogueYap and N.dialogueYap:FindFirstChild("Muzan")~=nil or false}
+    I.merchantActions=N.dialogueFunctions and N.dialogueFunctions:FindFirstChild("MerchantActions")~=nil or false
+    I.trainingStations=childNames(N.training,120)
+    I.skillsModules=#childNames(N.skills,2000)
+    I.ociCommands=childNames(N.ociFolder,200) -- EVIDENCE ONLY: never required/invoked
+    -- IDENTITY (static content; independent of what is streamed right now)
+    I.contentIdentity={}
+    local function contentFind(name)
+        if not N.ouwlandContent then return nil end
+        local ok,inst=pcall(function() return N.ouwlandContent:FindFirstChild(name,true) end)
+        return ok and inst and inst:GetFullName() or nil
+    end
+    for _,n in ipairs(WORLD_IDENTITIES) do I.contentIdentity[n]=contentFind(n) end
+    for _,t in ipairs(TRAINERS) do I.contentIdentity[t.." Trainer"]=contentFind(t.." Trainer") end
+    -- Final Selection identity: region evidence (not only a QuestStates name)
+    local fsr=N.humanoidRegions and N.humanoidRegions:FindFirstChild("Final Selection Plains")
+    I.finalSelectionRegion=fsr and fsr:GetFullName() or nil
+    if full then
+        -- PRESENCE (streamed in the world now); never lowers identity
+        I.finalSelectionWorld={}
+        for _,c in ipairs(workspace:GetChildren()) do if string.find(string.lower(c.Name),"final selection",1,true) then table.insert(I.finalSelectionWorld,c:GetFullName()) end end
+        I.trainers={}
+        for _,t in ipairs(TRAINERS) do I.trainers[t]=worldFind(t.." Trainer") end
+        I.world={}
+        for _,n in ipairs(WORLD_IDENTITIES) do I.world[n]=worldFind(n) end
+        SCH.fullAt=now
+    else I.trainers=SCH.identities.trainers or {}; I.world=SCH.identities.world or {}; I.finalSelectionWorld=SCH.identities.finalSelectionWorld or {} end
+    SCH.nodes=N; SCH.identities=I; SCH.builtAt=now
+    return SCH
+end
+function SCH.get(maxAge) if not SCH.builtAt or os.clock()-SCH.builtAt>(maxAge or 120) then pcall(SCH.build,false) end; return SCH end
+
+-- ---------- generic read-only decoder (bounded) ----------
+local function decodeValue(v)
+    if type(v)=="string" and (string.sub(v,1,1)=="{" or string.sub(v,1,1)=="[") then
+        local ok,t=pcall(function() return HttpService:JSONDecode(v) end); if ok then return t,"JSON" end
+    end
+    return v,nil
+end
+local function readTree(inst,depth,budget)
+    budget=budget or {n=0}; depth=depth or 0
+    if not inst or depth>6 or budget.n>900 then return nil end
+    budget.n=budget.n+1
+    local node={name=inst.Name,class=inst.ClassName}
+    if inst:IsA("ValueBase") then local ok,v=pcall(function() return inst.Value end); if ok then node.value,node.encoding=decodeValue(v) end end
+    local okA,attrs=pcall(function() return inst:GetAttributes() end); if okA and next(attrs) then node.attrs=attrs end
+    local kids=inst:GetChildren()
+    if #kids>0 then node.children={}; for _,c in ipairs(kids) do local n=readTree(c,depth+1,budget); if n then node.children[c.Name]=n end end end
+    return node
+end
+SCH.readTree=readTree
+
+-- ---------- adapters (read-only views) ----------
+local A={}
+RAVYN.DataAdapters=A
+local function section(name)
+    local s=SCH.get(); local root=s.nodes.sectionRoot
+    if not root then return nil,(SCH.slot and SCH.slot.status) or "PLAYER_DATA_NOT_FOUND" end
+    local inst=root:FindFirstChild(name); if not inst then return nil,"SECTION_NOT_FOUND:"..name end
+    return readTree(inst),nil
+end
+A.PlayerData=function()
+    local s=SCH.get(); local R=SCH.slot or {}
+    if not s.nodes.playerData then return nil,"PLAYER_DATA_NOT_FOUND" end
+    return {status=R.status,layout=R.layout,slot=R.slot and R.slot.Name,source=R.source,candidates=R.candidates,sections=s.identities.playerDataSections,path=s.nodes.playerData:GetFullName()}
+end
+A.Inventory=function() return section("Inventory") end
+A.Toolbar=function() return section("Toolbar") end
+A.Powers=function() return section("Powers") end
+A.ItemLoadouts=function() return section("ItemLoadouts") end
+A.Mastery=function() return section("MasteryProgressionList") end
+A.SkillTree=function() return section("SkillTreeUnlockedList") end
+-- Quests: replicated data vs zQuestsFrame GUI, cross-checked; QuestStates names are identities (never required)
+function A.Quests()
+    local data,err=section("Quests")
+    local names={}
+    if data and data.children then for k in pairs(data.children) do table.insert(names,k) end end
+    table.sort(names)
+    local AI=RAVYN.AdaptiveIntel; local gui=string.lower(AI and AI.quest and AI.quest.joined or "")
+    local known=SCH.get().identities.questStates or {}
+    local inGui,onlyData={},{}
+    for _,n in ipairs(names) do if gui~="" and string.find(gui,string.lower(n),1,true) then table.insert(inGui,n) else table.insert(onlyData,n) end end
+    local identity=nil
+    for _,n in ipairs(known) do if gui~="" and string.find(gui,string.lower(n),1,true) then identity=n; break end end
+    return {dataQuests=names,dataError=err,guiActive=gui~="",agreeing=inGui,onlyInData=onlyData,questStateIdentity=identity,
+        agreement=(err and not string.find(err,"SECTION_NOT_FOUND",1,true) and "DATA_UNRESOLVED") or (gui=="" and #names==0 and "BOTH_EMPTY") or ((#inGui>0) and "MATCH") or ((gui~="" and #names==0) and "GUI_ONLY") or ((gui=="" and #names>0) and "DATA_ONLY") or "MISMATCH"}
+end
+function A.Dialogue()
+    local s=SCH.get(); local N=s.nodes
+    return {quests=childNames(N.dialogueQuests,300),functions=childNames(N.dialogueFunctions,300),yap=childNames(N.dialogueYap,300)}
+end
+function A.Training()
+    local s=SCH.get(); local out={stations={},trainers={}}
+    local tr=s.nodes.training
+    if tr then
+        for _,st in ipairs(tr:GetChildren()) do
+            local prompts={}
+            for i,d in ipairs(st:GetDescendants()) do if i>200 then break end
+                if d:IsA("ProximityPrompt") then table.insert(prompts,d.ActionText.."|"..d.ObjectText) end end
+            table.insert(out.stations,{name=st.Name,class=st.ClassName,prompts=prompts})
+        end
+    end
+    for t,f in pairs(s.identities.trainers or {}) do out.trainers[t]=f and f.path or false end
+    return out
+end
+function A.Boss()
+    local s=SCH.get(); local metas={}
+    for name,m in pairs((RAVYN.BossMeta and RAVYN.BossMeta.byName) or {}) do metas[name]={chest=m.chest,onlyAtNight=m.onlyAtNight,streamed=m.streamed} end
+    return {bossHuntDialogues=s.identities.crowBossHuntDialogues,bossHuntNpcs=s.identities.crowBossHuntNpcs,bossInfo=metas}
+end
+function A.WorldActivity()
+    local s=SCH.get(); local out={}
+    for n,f in pairs(s.identities.world or {}) do out[n]=f and {path=f.path,class=f.class} or false end
+    return out
+end
+function RAVYN:GetRuntimeSchemaReport()
+    local s=SCH.build(true); local I=s.identities; local N=s.nodes
+    local function yes(x) return x and "FOUND" or "not found in this context" end
+    local L={"RUNTIME SCHEMA · "..tostring(RAVYN.Version).." · read-only · no require() · command modules never invoked",""}
+    table.insert(L,"Player_Service.Data.<LocalPlayer>: "..(N.playerData and N.playerData:GetFullName() or "not found"))
+    local R=SCH.slot or {}
+    table.insert(L,"  layout: "..tostring(R.layout).."  ·  active slot: "..tostring(R.status)..(R.slot and (" → "..R.slot.Name) or "")..(R.source and ("  (evidence: "..R.source..")") or ""))
+    for _,c in ipairs(R.candidates or {}) do table.insert(L,"    slot candidate "..c.name.."  sections "..c.sections..(c.flag and ("  flag "..c.flag) or "")) end
+    table.insert(L,"  sections: "..(#I.playerDataSections>0 and table.concat(I.playerDataSections,", ") or "unresolved"))
+    table.insert(L,"QuestStates: "..#I.questStates.." identities")
+    for i,n in ipairs(I.questStates) do if i>60 then table.insert(L,"   …"); break end; table.insert(L,"   "..n) end
+    table.insert(L,"Crow · Boss Hunts: "..yes(I.crowBossHuntsFound).."  dialogues "..#I.crowBossHuntDialogues.."  npcs "..#I.crowBossHuntNpcs)
+    table.insert(L,"Muzan: QuestState "..yes(I.muzanQuestState).." · MuzanActions "..yes(I.muzanDialogue.actions).." · Quests.Muzan "..yes(I.muzanDialogue.quests).." · Yap.Muzan "..yes(I.muzanDialogue.yap))
+    table.insert(L,"Trainers (identity · presence):")
+    for _,t in ipairs(TRAINERS) do local f=I.trainers[t]; local id=I.contentIdentity[t.." Trainer"]
+        table.insert(L,"   "..t.." Trainer: "..(id and "IDENTITY" or "identity not found").." · "..(f and ("PRESENT "..f.path) or "NOT_STREAMED")) end
+    table.insert(L,"Final Selection: region "..tostring(I.finalSelectionRegion).."  ·  world "..(#(I.finalSelectionWorld or {})>0 and table.concat(I.finalSelectionWorld,", ") or "none streamed"))
+    table.insert(L,"Workspace.Training: "..table.concat(I.trainingStations,", "))
+    table.insert(L,"World identities (identity · presence):")
+    for _,n in ipairs(WORLD_IDENTITIES) do local f=I.world[n]; local id=I.contentIdentity[n]
+        table.insert(L,"   "..n..": "..(id and ("IDENTITY "..id) or "identity not found").." · "..(f and ("PRESENT "..f.class.." "..f.path) or "NOT_STREAMED")) end
+    table.insert(L,"MerchantActions: "..yes(I.merchantActions).."  ·  Skills modules: "..I.skillsModules)
+    table.insert(L,"OCIFolder (evidence only, never invoked): "..(#I.ociCommands>0 and table.concat(I.ociCommands,", ") or "not found"))
+    table.insert(L,"Humanoids.Regions: "..yes(N.humanoidRegions).."  ·  Debree: "..yes(N.debree))
+    local q=A.Quests()
+    table.insert(L,""); table.insert(L,"Quest cross-check: "..q.agreement.."  data="..table.concat(q.dataQuests,", ").."  identity="..tostring(q.questStateIdentity))
+    return result(true,"RUNTIME_SCHEMA",table.concat(L,"\n"))
+end
+CTX["SCH391"]=SCH
+RAVYN.Logger:log("INFO","RUNTIME_SCHEMA_V391_READY")
+return true]==========]); if not ok then return end end
+do local ok=runChunk("UniversalTraceV391.lua",[==========[local G=(getgenv and getgenv()) or _G
+local CTX=G.__RAVYN_CTX
+local result=CTX["result"]
+local RAVYN=CTX["RAVYN"]
+-- v3.9.1 UniversalTrace: one START LEARNING. Records causes (prompt / game button / key) and effects
+-- (GUI, quest text, player data, tools, markers, NPCs, training), groups them ACTION → EFFECTS, infers
+-- CANDIDATE semantics. Never marks anything VERIFIED. All hooks exist only while tracing.
+local Players=game:GetService("Players")
+local UIS=game:GetService("UserInputService")
+local PPS=game:GetService("ProximityPromptService")
+local LP=Players.LocalPlayer
+local SCH=CTX["SCH391"]
+local TR={active=false,events={},groups={},ambient={},conns={},hooked={},hookCount=0,seq=0,last=nil,candidates={}}
+RAVYN.Trace=TR
+local MAX_EVENTS,MAX_HOOKS=4000,3000
+local MOVE_KEYS={W=true,A=true,S=true,D=true,Space=true,LeftShift=true,RightShift=true,LeftControl=true,Unknown=true}
+local function short(s,n) s=string.gsub(tostring(s or ""),"[\r\n]+"," "); return #s>(n or 70) and (string.sub(s,1,n or 70).."…") or s end
+local function esc(s) return (string.gsub(tostring(s),"[%%%.%-%+%*%?%[%]%^%$%(%)]","%%%0")) end
+local function rel(inst)
+    local p=inst:GetFullName()
+    local me=esc(LP and LP.Name or "_")
+    p=string.gsub(p,"^Players%."..me.."%.PlayerGui%.","GUI:")
+    local slot=SCH and SCH.slot and SCH.slot.slot and SCH.slot.layout=="SLOTS" and SCH.slot.slot.Name
+    if slot then p=string.gsub(p,"^ReplicatedStorage%.Player_Service%.Data%."..me.."%.[sS]lots%."..esc(slot).."%.","DATA:") end
+    p=string.gsub(p,"^ReplicatedStorage%.Player_Service%.Data%."..me.."%.[sS]lots%.([^%.]+)%.","DATA[%1]:")
+    p=string.gsub(p,"^ReplicatedStorage%.Player_Service%.Data%."..me.."%.","DATA:")
+    p=string.gsub(p,"^Workspace%.","WS:")
+    return p
+end
+local function conn(sig,fn) if TR.hookCount>=MAX_HOOKS then return end; TR.hookCount=TR.hookCount+1; table.insert(TR.conns,sig:Connect(fn)) end
+
+-- ---------- event intake + causal grouping ----------
+local function push(kind,text,isCause)
+    if not TR.active or #TR.events>=MAX_EVENTS then return end
+    local now=os.clock(); local t=now-TR.startedAt
+    local ev={t=t,kind=kind,text=text}
+    table.insert(TR.events,ev)
+    if isCause then
+        local g={cause=ev,effects={},openUntil=now+3,hardUntil=now+6}
+        table.insert(TR.groups,g); TR.open=g
+        while #TR.groups>200 do table.remove(TR.groups,1) end
+        return
+    end
+    local g=TR.open
+    if g and now<=g.openUntil then
+        table.insert(g.effects,ev); g.openUntil=math.min(g.hardUntil,math.max(g.openUntil,now+1))
+    else
+        TR.open=nil
+        local slice=math.floor(t/5)
+        local a=TR.ambient[#TR.ambient]
+        if not a or a.slice~=slice then a={slice=slice,effects={}}; table.insert(TR.ambient,a); while #TR.ambient>120 do table.remove(TR.ambient,1) end end
+        if #a.effects<60 then table.insert(a.effects,ev) end
+    end
+end
+-- ---------- hooks ----------
+local function isInterestingGui(d)
+    if d:IsA("LayerCollector") or d:IsA("GuiButton") then return true end
+    if (d:IsA("TextLabel") or d:IsA("TextBox")) and d.Text~="" then return true end
+    return d:IsA("GuiObject") and d.Parent~=nil and d.Parent:IsA("LayerCollector")
+end
+-- Typed hook flags: the same Instance may need more than one observer.
+-- Example: a TextButton needs both Activated and Text-change hooks.
+local function hookFlags(inst)
+    local f=TR.hooked[inst]
+    if type(f)~="table" then f={}; TR.hooked[inst]=f end
+    return f
+end
+local function hookButton(d,own)
+    if not d:IsA("GuiButton") or (own and d:IsDescendantOf(own)) then return end
+    local f=hookFlags(d); if f.button then return end; f.button=true
+    conn(d.Activated,function()
+        local txt=d:IsA("TextButton") and d.Text or ""; local lbl=d:FindFirstChildWhichIsA("TextLabel",true)
+        push("BUTTON",rel(d).." '"..short(txt~="" and txt or (lbl and lbl.Text) or "",40).."'",true)
+    end)
+end
+local function hookText(d)
+    if not (d:IsA("TextLabel") or d:IsA("TextButton")) then return end
+    local f=hookFlags(d); if f.text then return end; f.text=true
+    conn(d:GetPropertyChangedSignal("Text"),function() push("TEXT",rel(d).." = "..short(d.Text,80)) end)
+end
+local function hookValue(d)
+    if not d:IsA("ValueBase") then return end
+    local f=hookFlags(d); if f.value then return end; f.value=true
+    conn(d.Changed,function(v) push("DATA_CHANGED",rel(d).." = "..short(tostring(v),80)) end)
+end
+local function startHooks()
+    local own=RAVYN._gui
+    local pg=LP and LP:FindFirstChildOfClass("PlayerGui")
+    conn(PPS.PromptTriggered,function(pr,plr) if plr==LP then push("PROMPT",rel(pr).." ["..pr.ActionText.."|"..pr.ObjectText.."]",true) end end)
+    conn(UIS.InputBegan,function(input)
+        if input.UserInputType==Enum.UserInputType.Keyboard and not MOVE_KEYS[input.KeyCode.Name] then push("KEY",input.KeyCode.Name,true) end
+    end)
+    if pg then
+        for i,d in ipairs(pg:GetDescendants()) do if i>6000 then break end; hookButton(d,own) end
+        conn(pg.DescendantAdded,function(d)
+            if own and d:IsDescendantOf(own) then return end
+            hookButton(d,own)
+            if isInterestingGui(d) then push("GUI_ADDED",rel(d)..((d:IsA("TextLabel") or d:IsA("TextButton")) and (" '"..short(d.Text,40).."'") or "")) end
+        end)
+        conn(pg.DescendantRemoving,function(d)
+            if own and d:IsDescendantOf(own) then return end
+            if isInterestingGui(d) then push("GUI_REMOVED",rel(d)) end
+        end)
+        -- known quest GUI text
+        local a=pg:FindFirstChild("ComponentsHolder"); local b=a and a:FindFirstChild("LeftCenterFramesHolder")
+        local roots={b and b:FindFirstChild("zQuestsFrame"),pg:FindFirstChild("QuestionStrip",true)}
+        for _,r in ipairs(roots) do if r then
+            for i,d in ipairs(r:GetDescendants()) do if i>800 then break end; hookText(d) end
+            conn(r.DescendantAdded,function(d) hookText(d) end)
+        end end
+    end
+    -- player data (local player only)
+    local pd=SCH and SCH.get().nodes.playerData
+    if pd then
+        for i,d in ipairs(pd:GetDescendants()) do if i>1500 then break end; hookValue(d) end
+        conn(pd.DescendantAdded,function(d) hookValue(d); push("DATA_ADDED",rel(d)..(d:IsA("ValueBase") and (" = "..short(tostring(d.Value),60)) or "")) end)
+        conn(pd.DescendantRemoving,function(d) push("DATA_REMOVED",rel(d)) end)
+        conn(pd.AttributeChanged,function(k) push("DATA_ATTR","DATA@"..k.." = "..short(tostring(pd:GetAttribute(k)),60)) end)
+    end
+    if LP then conn(LP.AttributeChanged,function(k) push("PLAYER_ATTR","Player@"..k.." = "..short(tostring(LP:GetAttribute(k)),60)) end) end
+    -- tools
+    local bp=LP and LP:FindFirstChildOfClass("Backpack")
+    if bp then conn(bp.ChildAdded,function(c) push("TOOL","backpack + "..c.Name) end); conn(bp.ChildRemoved,function(c) push("TOOL","backpack - "..c.Name) end) end
+    local char=LP and LP.Character
+    if char then conn(char.ChildAdded,function(c) if c:IsA("Tool") then push("TOOL","equipped "..c.Name) end end); conn(char.ChildRemoved,function(c) if c:IsA("Tool") then push("TOOL","unequipped "..c.Name) end end) end
+    -- markers (world + gui), cheap class filter
+    conn(workspace.DescendantAdded,function(d) if d:IsA("BillboardGui") or d:IsA("Highlight") or d:IsA("Beam") then push("MARKER_ADDED",rel(d)) end end)
+    conn(workspace.DescendantRemoving,function(d) if d:IsA("BillboardGui") or d:IsA("Highlight") or d:IsA("Beam") then push("MARKER_REMOVED",rel(d)) end end)
+    -- NPC spawn/despawn/death in Humanoids.Regions.
+    -- NPCs live in Workspace.Humanoids.Regions.<Region>.ActiveNpcs.
+    -- Event-driven only: no health polling and no continuous Workspace scans.
+    local regions=SCH and SCH.get().nodes.humanoidRegions
+    if regions then
+        local function hookNpcDeath(r,entity)
+            if not entity then return end
+            local ef=hookFlags(entity)
+            if ef.deathwatch then return end
+            ef.deathwatch=true
+
+            local function attachHumanoid(h)
+                if not (h and h:IsA("Humanoid")) then return end
+                local hf=hookFlags(h); if hf.death then return end; hf.death=true
+                local model=h:FindFirstAncestorWhichIsA("Model") or entity
+                local npcName=(model and model.Name) or entity.Name
+                local modelPath=model and rel(model) or rel(entity)
+                local previous=tonumber(h.Health) or 0
+                local function emitDeath(source)
+                    if hf.deathEmitted then return end
+                    hf.deathEmitted=true
+                    push("NPC_DIED",r.Name.." "..npcName.." "..modelPath.." ["..source.."]")
+                end
+                conn(h.Died,function() emitDeath("Died") end)
+                conn(h:GetPropertyChangedSignal("Health"),function()
+                    local now=tonumber(h.Health) or 0
+                    if previous>0 and now<=0 then emitDeath("HealthZero") end
+                    previous=now
+                end)
+            end
+
+            local h=entity:IsA("Humanoid") and entity or entity:FindFirstChildWhichIsA("Humanoid",true)
+            if h then attachHumanoid(h) end
+            -- Some streamed NPC holders receive their model/humanoid after the holder itself is inserted.
+            conn(entity.DescendantAdded,function(d) if d:IsA("Humanoid") then attachHumanoid(d) end end)
+        end
+
+        local function hookActive(r,an)
+            local af=hookFlags(an); if af.container then return end; af.container=true
+            for _,c in ipairs(an:GetChildren()) do hookNpcDeath(r,c) end
+            conn(an.ChildAdded,function(c)
+                push("NPC_SPAWN",r.Name.." + "..c.Name)
+                hookNpcDeath(r,c)
+            end)
+            conn(an.ChildRemoved,function(c) push("NPC_DESPAWN",r.Name.." - "..c.Name) end)
+        end
+        local function hookRegion(r)
+            local rf=hookFlags(r); if rf.region then return end; rf.region=true
+            local an=r:FindFirstChild("ActiveNpcs"); if an then hookActive(r,an) end
+            conn(r.ChildAdded,function(c) if c.Name=="ActiveNpcs" then hookActive(r,c) end end)
+        end
+        for _,r in ipairs(regions:GetChildren()) do hookRegion(r) end
+        conn(regions.ChildAdded,function(r) hookRegion(r) end)
+    end
+    -- training stations
+    local tr=SCH and SCH.get().nodes.training
+    if tr then
+        conn(tr.DescendantAdded,function(d) if d:IsA("ProximityPrompt") or d:IsA("Model") or d:IsA("GuiBase") then push("TRAINING",rel(d).." added") end end)
+        conn(tr.DescendantRemoving,function(d) if d:IsA("ProximityPrompt") or d:IsA("Model") then push("TRAINING",rel(d).." removed") end end)
+        for i,d in ipairs(tr:GetDescendants()) do
+            if i>1500 then break end
+            if d:IsA("ProximityPrompt") then conn(d:GetPropertyChangedSignal("Enabled"),function() push("TRAINING",rel(d).." enabled="..tostring(d.Enabled)) end) end
+        end
+    end
+end
+local function stopHooks()
+    TR.hooksUsed=TR.hookCount -- preserve for the report before resetting
+    for _,c in ipairs(TR.conns) do pcall(function() c:Disconnect() end) end
+    TR.conns={}; TR.hooked={}; TR.hookCount=0; TR.open=nil
+end
+
+-- ---------- candidate semantics (never VERIFIED) ----------
+local function has(effects,kind,pattern)
+    for _,e in ipairs(effects) do if e.kind==kind and (not pattern or string.find(string.lower(e.text),pattern,1,true)) then return e end end
+    return nil
+end
+local function infer()
+    local C={}; local seen={}
+    local function add(conf,text)
+        if seen[text] then return end
+        seen[text]=true
+        table.insert(C,{confidence=conf,text=text})
+    end
+    for _,g in ipairs(TR.groups) do
+        local c=g.cause; local ct=string.lower(c.text); local E=g.effects
+        local questGui=has(E,"TEXT","zquestsframe") or has(E,"GUI_ADDED","zquestsframe")
+        local questData=has(E,"DATA_ADDED","data:quests") or has(E,"DATA_CHANGED","data:quests")
+        if c.kind=="BUTTON" and (string.find(ct,"claim",1,true) or string.find(ct,"accept",1,true) or string.find(ct,"start",1,true)) and (questGui or questData) then
+            add((questGui and questData) and "HIGH" or "MEDIUM","quest accept action: "..c.text..(questData and (" → "..questData.text) or "")..(questGui and (" → "..questGui.text) or ""))
+        elseif (c.kind=="PROMPT" or c.kind=="BUTTON") and (questGui or questData) then
+            add("MEDIUM","action changes quest state: "..c.text)
+        end
+        if c.kind=="PROMPT" and has(E,"GUI_ADDED") then add("MEDIUM","prompt opens GUI: "..c.text.." → "..has(E,"GUI_ADDED").text) end
+        local inv=has(E,"DATA_ADDED","data:inventory") or has(E,"DATA_CHANGED","data:inventory")
+        if inv then add("MEDIUM","action changes inventory: "..c.text.." → "..inv.text) end
+        local mk=has(E,"MARKER_ADDED"); if mk and (questGui or questData) then add("MEDIUM","objective marker after "..c.text.." → "..mk.text) end
+        local trn=has(E,"TRAINING"); if trn then add("LOW","training state reacts to "..c.text.." → "..trn.text) end
+        local tool=has(E,"TOOL"); if tool then add("LOW","tool change after "..c.text.." → "..tool.text) end
+    end
+    for _,a in ipairs(TR.ambient) do
+        local qd=has(a.effects,"DATA_CHANGED","data:quests") or has(a.effects,"DATA_ADDED","data:quests")
+        local qt=has(a.effects,"TEXT","zquestsframe") or has(a.effects,"GUI_ADDED","zquestsframe")
+        local died=has(a.effects,"NPC_DIED")
+        if (qd or qt) and died then
+            add("HIGH","quest objective progressed after NPC death: "..died.text.." → "..((qd or qt).text))
+        elseif (qd or qt) and has(a.effects,"NPC_DESPAWN") then
+            add("LOW","quest progress after NPC despawn: "..((qd or qt).text))
+        end
+    end
+    -- Strong temporal correlation independent of ambient slicing/action groups:
+    -- an NPC_DIED followed shortly by quest GUI/data change is objective-progress evidence.
+    for i,e in ipairs(TR.events) do
+        if e.kind=="NPC_DIED" then
+            for j=i+1,#TR.events do
+                local q=TR.events[j]; local dt=q.t-e.t
+                if dt>4 then break end
+                local low=string.lower(q.text or "")
+                local questChange=(q.kind=="DATA_CHANGED" or q.kind=="DATA_ADDED" or q.kind=="DATA_REMOVED") and string.find(low,"data:quests",1,true)
+                    or (q.kind=="TEXT" or q.kind=="GUI_ADDED" or q.kind=="GUI_REMOVED") and string.find(low,"zquestsframe",1,true)
+                if questChange then
+                    add("HIGH","quest objective progressed after NPC death: "..e.text.." → "..q.text)
+                    break
+                end
+            end
+        end
+    end
+    -- active-slot evidence: which local slot changed while playing (only when the slot is unresolved)
+    local perSlot={}
+    for _,e in ipairs(TR.events) do local sl=string.match(e.text,"^DATA%[([^%]]+)%]:"); if sl then perSlot[sl]=(perSlot[sl] or 0)+1 end end
+    for sl,n in pairs(perSlot) do add(n>=3 and "MEDIUM" or "LOW","active slot evidence: "..sl.." changed "..n.."× during play (resolver: "..tostring(SCH and SCH.slot and SCH.slot.status)..")") end
+    TR.candidates=C
+    return C
+end
+
+-- ---------- control ----------
+function RAVYN:StartLearning()
+    if TR.active then return result(false,"ALREADY_LEARNING") end
+    TR.seq=TR.seq+1; TR.active=true; TR.startedAt=os.clock(); TR.clock=os.date("%H:%M:%S")
+    TR.events={}; TR.groups={}; TR.ambient={}; TR.candidates={}
+    TR.saved=false; TR.cancelled=nil; TR.hooksUsed=0
+    local ok,err=pcall(startHooks)
+    if not ok then stopHooks(); TR.active=false; return result(false,"TRACE_HOOK_FAILED",tostring(err)) end
+    RAVYN.Logger:log("INFO","UNIVERSAL_TRACE_START",{hooks=TR.hookCount})
+    return result(true,"LEARNING",{hooks=TR.hookCount})
+end
+local function report()
+    local L={string.format("UNIVERSAL TRACE #%03d · %s · %.0fs · %d events · %d action groups · %d hooks",TR.seq,TR.clock,os.clock()-TR.startedAt,#TR.events,#TR.groups,TR.hooksUsed or 0),
+        "status: CANDIDATES ONLY — nothing is verified automatically",""}
+    table.insert(L,"CANDIDATE SEMANTICS")
+    for _,c in ipairs(TR.candidates) do table.insert(L,"  ["..c.confidence.."] "..c.text) end
+    if #TR.candidates==0 then table.insert(L,"  none inferred") end
+    table.insert(L,""); table.insert(L,"ACTION → EFFECTS")
+    for _,g in ipairs(TR.groups) do
+        if #g.effects>0 then
+            table.insert(L,string.format("+%.1fs %s %s",g.cause.t,g.cause.kind,g.cause.text))
+            for i,e in ipairs(g.effects) do if i>25 then table.insert(L,"      … "..(#g.effects-25).." more"); break end; table.insert(L,string.format("      +%.1fs %s %s",e.t,e.kind,e.text)) end
+        end
+    end
+    table.insert(L,""); table.insert(L,"AMBIENT (no user action)")
+    for _,a in ipairs(TR.ambient) do
+        local interesting={}
+        for _,e in ipairs(a.effects) do if e.kind~="MARKER_ADDED" and e.kind~="MARKER_REMOVED" then table.insert(interesting,e) end end
+        for i,e in ipairs(interesting) do if i>12 then break end; table.insert(L,string.format("  +%.1fs %s %s",e.t,e.kind,e.text)) end
+    end
+    return table.concat(L,"\n")
+end
+function RAVYN:StopLearning()
+    if not TR.active then return result(false,"NOT_LEARNING") end
+    stopHooks(); TR.active=false
+    infer()
+    TR.last=report()
+    local FR=RAVYN.FeatureRegistry; if FR and FR.applyTrace then pcall(FR.applyTrace,TR.candidates) end
+    local wf=(getgenv and getgenv().writefile) or G.writefile
+    if type(wf)=="function" then pcall(function()
+        local mf=(getgenv and getgenv().makefolder) or G.makefolder; local isf=(getgenv and getgenv().isfolder) or G.isfolder
+        if mf and isf and not isf("RAVYN") then mf("RAVYN") end
+        if mf and isf and not isf("RAVYN/Traces") then mf("RAVYN/Traces") end
+        wf("RAVYN/Traces/"..os.date("%Y%m%d_%H%M%S").."_"..string.format("%03d",TR.seq).."_trace.txt",TR.last)
+        TR.saved=true
+    end) end
+    RAVYN.Logger:log("INFO","UNIVERSAL_TRACE_STOP",{events=#TR.events,candidates=#TR.candidates})
+    return result(true,"TRACE_COMPLETE",{events=#TR.events,groups=#TR.groups,candidates=#TR.candidates})
+end
+function RAVYN:CopyTraceReport()
+    local f=(getgenv and getgenv().setclipboard) or G.setclipboard
+    if not TR.last then return result(false,"NO_TRACE") end
+    if type(f)~="function" then return result(false,"SETCLIPBOARD_UNAVAILABLE") end
+    pcall(f,TR.last); return result(true,"TRACE_COPIED")
+end
+-- Stop Everything / Destroy cancel an in-progress trace; partial traces are not saved as evidence
+local baseStop=RAVYN.Stop
+function RAVYN:Stop() if TR.active then stopHooks(); TR.active=false; TR.cancelled=os.clock() end; return baseStop(self) end
+local baseDestroy=RAVYN.Destroy
+function RAVYN:Destroy() if TR.active then stopHooks(); TR.active=false end; return baseDestroy(self) end
+CTX["TR391"]=TR
+RAVYN.Logger:log("INFO","UNIVERSAL_TRACE_V391_READY")
+return true]==========]); if not ok then return end end
+do local ok=runChunk("FeatureRegistryV391.lua",[==========[local G=(getgenv and getgenv()) or _G
+local CTX=G.__RAVYN_CTX
+local result=CTX["result"]
+local RAVYN=CTX["RAVYN"]
+-- v3.9.1.1 FeatureRegistry: IDENTITY · PRESENCE · ACTION · VERIFY are SEPARATE.
+-- IDENTITY: the system exists in static runtime content (Ouwland.Content, QuestStates, dialogues, regions, player data).
+-- PRESENCE: an instance is streamed in the world right now (as of the last explicit refresh). Never lowers identity.
+-- ACTION / VERIFY: implemented path or UniversalTrace CANDIDATE — never auto-VERIFIED.
+local SCH=CTX["SCH391"]
+local FR={features={},order={},refreshedAt=nil}
+RAVYN.FeatureRegistry=FR
+local function feat(key,title,keys,identityFn,presenceFn,action,verify,note)
+    FR.features[key]={key=key,title=title,keys=keys,identityFn=identityFn,presenceFn=presenceFn,
+        identity="UNRESOLVED",presence="N/A",action=action or "UNRESOLVED",verify=verify or "UNRESOLVED",note=note}
+    table.insert(FR.order,key)
+end
+local function I() return SCH.get().identities end
+local function qsHas(word) for _,n in ipairs(I().questStates or {}) do if string.find(string.lower(n),word,1,true) then return "QuestStates."..n end end; return nil end
+local function content(name) return (I().contentIdentity or {})[name] end
+local function present(name) local f=(I().world or {})[name]; return f and f.path or nil end
+local function sec(name) for _,n in ipairs(I().playerDataSections or {}) do if n==name then return "slot."..n end end; return nil end
+local function idOf(ev) if ev then return "VERIFIED",ev end; return "NOT_FOUND_IN_CONTEXT",nil end
+local function presOf(...)
+    if not SCH.fullAt then return "NOT_CHECKED",nil end
+    for _,n in ipairs({...}) do local p=present(n); if p then return "PRESENT",p end end
+    return "NOT_STREAMED",nil
+end
+local function na() return "N/A",nil end
+local function any(...) for _,v in ipairs({...}) do if v then return v end end; return nil end
+
+feat("CROW","Crow (Boss Hunts)",{"hunt"},function() local x=I(); return idOf(x.crowBossHuntsFound and ("Boss Hunts dialogues "..#x.crowBossHuntDialogues.." · npcs "..#x.crowBossHuntNpcs) or nil) end,na)
+feat("MUZAN","Muzan",{"muzan"},function()
+    local x=I(); local ev=(x.muzanQuestState and "QuestStates.Muzan Quest" or "")..(x.muzanDialogue.actions and " · MuzanActions" or "")..(x.muzanDialogue.quests and " · Dialogues.Quests.Muzan" or "")
+    return idOf(ev~="" and ev or nil) end,function() return presOf("Muzan") end,nil,nil,"transformation and repeatable tasks are separate flows")
+feat("QUESTS","Generic quests",{"quest"},function() local n=#(I().questStates or {}); return idOf((n>0 or sec("Quests")) and (n.." QuestStates"..(sec("Quests") and " · slot Quests" or "")) or nil) end,na,
+    "PARTIAL","PARTIAL","action: prompt + dialogue · verify: GUI signature + slot data cross-check")
+feat("BREATHING","Breathing trainers",{"trainer","breath"},function()
+    local n=0
+    for _,t in ipairs({"Flame","Thunder","Water","Wind","Stone","Serpent","Insect","Sound"}) do if content(t.." Trainer") then n=n+1 end end
+    return idOf(n>0 and (n.." of 8 trainer identities in Ouwland.Content") or nil) end,
+    function()
+        if not SCH.fullAt then return "NOT_CHECKED",nil end
+        local n=0; for _,f in pairs(I().trainers or {}) do if f then n=n+1 end end
+        return n>0 and "PRESENT" or "NOT_STREAMED",n>0 and (n.." streamed") or nil end)
+feat("TRAINING","Training stations",{"training","push","boulder","parkour","meditat","cup","aim","squat"},function() local s=I().trainingStations or {}; return idOf(#s>0 and ("Workspace.Training: "..#s.." entries") or nil) end,na)
+feat("FINAL_SELECTION","Final Selection",{"final selection"},function()
+    local x=I(); return idOf(any(x.finalSelectionRegion and ("region "..x.finalSelectionRegion) or nil,qsHas("final"),(x.finalSelectionWorld and x.finalSelectionWorld[1]) and ("world "..x.finalSelectionWorld[1]) or nil)) end,
+    function() local w=I().finalSelectionWorld; if not SCH.fullAt then return "NOT_CHECKED",nil end; return (w and #w>0) and "PRESENT" or "NOT_STREAMED",w and w[1] end)
+feat("OUWIGAHARA","Ouwigahara",{"ouwi","card","dungeon"},function() local n=SCH.get().nodes; return n.ouwlandContent and "PARTIAL" or "NOT_FOUND_IN_CONTEXT",n.ouwlandContent and "Ouwland.Content present; cards not found" or nil end,na)
+feat("FISHING","Fishing",{"fish"},function() return idOf(qsHas("fishing")) end,na)
+feat("ESCORT","Escort",{"escort","akio"},function() return idOf(qsHas("escort")) end,na)
+feat("SEALED_CHESTS","Sealed chests",{"sealed chest"},function() return idOf(any(content("Sealed Chest T1"),content("Sealed Chest T2"),content("Sealed Chest T3"))) end,
+    function() return presOf("Sealed Chest T1","Sealed Chest T2","Sealed Chest T3") end)
+feat("SOULS","Souls (Harvester)",{"soul"},function() return idOf(content("Harvester of Souls Zurinyz")) end,function() return presOf("Harvester of Souls Zurinyz") end)
+feat("YETI","Yeti",{"yeti"},function() return idOf(content("Yeti Summon")) end,function() return presOf("Yeti Summon") end)
+feat("BLACK_MARKETER","Black Marketer",{"black marketer"},function() return idOf(content("Black Marketer")) end,function() return presOf("Black Marketer") end)
+feat("SHOPS","Shops / merchants",{"merchant","shop","buy","purchase"},function() return idOf(I().merchantActions and "Dialogues.Functions.MerchantActions" or nil) end,na)
+feat("REFINE","Refine",{"refin"},function() return idOf(content("Refiner Hagane")) end,function() return presOf("Refiner Hagane") end)
+feat("SKILL_TREE","Skill tree",{"skilltree","skill tree"},function() return idOf(sec("SkillTreeUnlockedList")) end,na)
+feat("MASTERY","Mastery",{"mastery"},function() return idOf(sec("MasteryProgressionList")) end,na)
+feat("CLAN","Clan",{"clan"},function()
+    local ev=sec("Clan"); if ev then return "VERIFIED",ev end
+    for _,c in ipairs(I().ociCommands or {}) do if string.find(string.lower(c),"clan",1,true) then return "CANDIDATE","command module name only (never invoked)" end end
+    return "NOT_FOUND_IN_CONTEXT",nil end,na)
+feat("EQUIPMENT","Equipment / loadouts",{"loadout","equip","inventory"},function() return idOf(sec("ItemLoadouts") or sec("Inventory")) end,na)
+feat("ESP","ESP",{},function() return "LOCAL","RAVYN-drawn overlay" end,na,"PARTIAL","N/A","local rendering, no game binding")
+feat("POSITION","Position toolkit",{},function() return "LOCAL","RAVYN saved places" end,na,"PARTIAL","N/A","local, no game binding")
+
+-- explicit refresh only (no continuous world polling). full=true also re-checks presence.
+function FR.refresh(full)
+    pcall(SCH.build,full==true)
+    for _,k in ipairs(FR.order) do
+        local f=FR.features[k]
+        local ok,st,ev=pcall(f.identityFn); f.identity=ok and st or "UNRESOLVED"; f.identityEvidence=ok and ev or tostring(st)
+        local okP,pst,pev=pcall(f.presenceFn)
+        -- presence never lowers identity; it only reports what is streamed now
+        f.presence=okP and pst or "UNRESOLVED"; f.presenceEvidence=okP and pev or nil
+    end
+    local mz=FR.features.MUZAN; local wm=(I().world or {}).Muzan
+    if wm and wm.inst and wm.inst:FindFirstChildWhichIsA("ProximityPrompt",true) and mz.action=="UNRESOLVED" then mz.action="CANDIDATE"; mz.actionEvidence="world Muzan ProximityPrompt present" end
+    FR.refreshedAt=os.clock(); FR.presenceAt=full and os.clock() or FR.presenceAt
+end
+-- UniversalTrace candidates → ACTION / VERIFY candidates (never VERIFIED)
+function FR.applyTrace(candidates)
+    for _,c in ipairs(candidates or {}) do
+        local t=string.lower(c.text)
+        for _,k in ipairs(FR.order) do
+            local f=FR.features[k]
+            for _,w in ipairs(f.keys) do
+                if string.find(t,w,1,true) then
+                    if f.action=="UNRESOLVED" or f.action=="CANDIDATE" then f.action="CANDIDATE"; f.actionEvidence="["..c.confidence.."] "..c.text end
+                    if (string.find(t,"data:",1,true) or string.find(t,"zquestsframe",1,true)) and (f.verify=="UNRESOLVED" or f.verify=="CANDIDATE") then
+                        f.verify="CANDIDATE"; f.verifyEvidence="["..c.confidence.."] "..c.text end
+                    break
+                end
+            end
+        end
+    end
+end
+function RAVYN:GetFeatureRegistryReport()
+    FR.refresh(true)
+    local L={"FEATURE REGISTRY · IDENTITY / PRESENCE / ACTION / VERIFY are separate · nothing auto-VERIFIED",
+        "presence checked now (explicit refresh); NOT_STREAMED never lowers identity",""}
+    for _,k in ipairs(FR.order) do
+        local f=FR.features[k]
+        table.insert(L,string.format("%-22s identity %-20s presence %-13s action %-11s verify %s",f.title,f.identity,f.presence,f.action,f.verify))
+        for _,x in ipairs({{"identity",f.identityEvidence},{"presence",f.presenceEvidence},{"action",f.actionEvidence},{"verify",f.verifyEvidence},{"note",f.note}}) do
+            if x[2] then table.insert(L,"      "..x[1]..": "..tostring(x[2])) end
+        end
+    end
+    table.insert(L,""); table.insert(L,"Not yet found in this context (not claimed absent): Gourds, Spider Lilies, Ouwigahara cards, Forge.")
+    return result(true,"FEATURE_REGISTRY",table.concat(L,"\n"))
+end
+function RAVYN:CopyDiscoveryReport()
+    local f=(getgenv and getgenv().setclipboard) or G.setclipboard
+    local b=self:GetFeatureRegistryReport(); local a=self:GetRuntimeSchemaReport()
+    local text=a.value.."\n\n"..b.value
+    if type(f)~="function" then return result(false,"SETCLIPBOARD_UNAVAILABLE",text) end
+    pcall(f,text); return result(true,"DISCOVERY_REPORT_COPIED")
+end
+CTX["FR391"]=FR
+RAVYN.Logger:log("INFO","FEATURE_REGISTRY_V3911_READY")
+return true]==========]); if not ok then return end end
+
+do local ok=runChunk("CrowControllerV393.lua",[==========[local G=(getgenv and getgenv()) or _G
+local CTX=G.__RAVYN_CTX
+local Util=CTX["Util"]
+local Config=CTX["Config"]
+local result=CTX["result"]
+local RAVYN=CTX["RAVYN"]
+local requestTravel=CTX["requestTravel384"]
+local Players=game:GetService("Players")
+local RS=game:GetService("ReplicatedStorage")
+local LP=Players.LocalPlayer
+local VIM=game:GetService("VirtualInputManager")
+
+-- v3.9.3 Direct Crow controller.
+-- Evidence reviewed from two live UniversalTrace captures:
+--   toolbar slot 5 -> Kasugai Crow mission GUI
+--   Hunt5.Claim  -> DATA:Quests.Holder.Eliminate Datai within ~0.1 s
+--   Hunt10.Claim -> DATA:Quests.Holder.Eliminate Enru within ~0.1 s
+-- This controller uses those GUI/data bindings only. No ModuleScript require(), no game remote calls.
+
+local defaults={
+    Enabled=false,
+    PreferNearest=true,
+    TickInterval=.35,
+    OpenCooldown=2.5,
+    AcceptCooldown=1.0,
+    AcceptVerifyTimeout=3.0,
+    MenuWait=4.5,
+    TargetArrivalHeight=5.5,
+    ReTeleportDistance=80,
+}
+Config.Default.CrowDirect=Util.deepCopy(defaults)
+RAVYN.Config.CrowDirect=Util.deepMerge(defaults,RAVYN.Config.CrowDirect or {})
+local function cfg() return RAVYN.Config.CrowDirect end
+local CD={
+    status="READY", detail="",
+    missionsSeen=0, accepted=0, completed=0,
+    lastOpenAt=-math.huge,lastAcceptAt=-math.huge,lastTravelAt=-math.huge,
+    pending=nil,lastQuestId=nil,lastQuestTarget=nil,lastTarget=nil,lastCenter=nil,
+    waitUntil=0,dailyCurrent=nil,dailyMax=nil,dailyComplete=false,
+    centerCache={},savedAutoQuestSources=nil,events={},
+}
+RAVYN.CrowDirect=CD
+
+local function low(v) return string.lower(tostring(v or "")) end
+local function trim(v)
+    v=tostring(v or ""):gsub("<.->",""):gsub("^%s+",""):gsub("%s+$","")
+    return v
+end
+local function log(text,kind)
+    CD.detail=tostring(text or "")
+    table.insert(CD.events,{at=os.clock(),text=CD.detail,kind=kind or "info"})
+    while #CD.events>20 do table.remove(CD.events,1) end
+    if RAVYN.Logger then RAVYN.Logger:log("INFO","CROW · "..CD.detail,{kind=kind}) end
+end
+local function setStatus(s,d)
+    if CD.status~=s then CD.status=s; if d then log(d) end elseif d then CD.detail=d end
+end
+local function getPG() return LP and LP:FindFirstChildOfClass("PlayerGui") end
+local function rootPart()
+    local r=RAVYN.ReadAdapter and RAVYN.ReadAdapter:getRootPart() or nil
+    return r and r.ok and r.value or nil
+end
+local function goWants()
+    if cfg().Enabled==true then return true end
+    local GO=RAVYN.GoState
+    return GO and GO.active and not GO.paused and (GO.goal=="AUTO_PROGRESS" or GO.goal=="QUESTS")
+end
+local function running()
+    return goWants() and RAVYN.FSM and RAVYN.FSM.state=="RUNNING"
+end
+local function clickCenter(btn)
+    if not btn or not btn.Parent or not btn:IsA("GuiButton") then return false,"BUTTON_MISSING" end
+    local visible=true
+    local cur=btn
+    while cur and cur:IsA("GuiObject") do
+        if cur.Visible==false then visible=false; break end
+        cur=cur.Parent
+    end
+    if not visible then return false,"BUTTON_HIDDEN" end
+    local p,s=btn.AbsolutePosition,btn.AbsoluteSize
+    if s.X<2 or s.Y<2 then return false,"BUTTON_ZERO_SIZE" end
+    local x=math.floor(p.X+s.X*.5); local y=math.floor(p.Y+s.Y*.5)
+    local IA=RAVYN.InputAudit; if IA and IA.note then IA.note("MOUSE","crow "..tostring(btn.Name),"CROW") end
+    local ok,err=pcall(function()
+        VIM:SendMouseButtonEvent(x,y,0,true,game,0)
+        task.wait(.025)
+        VIM:SendMouseButtonEvent(x,y,0,false,game,0)
+    end)
+    return ok,ok and "CLICKED" or tostring(err)
+end
+local function toolbarCrowButton()
+    local pg=getPG(); if not pg then return nil end
+    local c=pg:FindFirstChild("ComponentsHolder")
+    local b=c and c:FindFirstChild("BottomHolder")
+    local t=b and b:FindFirstChild("Toolbar")
+    local s=t and t:FindFirstChild("SkillHolder")
+    local btn=s and s:FindFirstChild("5_ToolPosition")
+    return btn and btn:IsA("GuiButton") and btn or nil
+end
+local function crowMenu()
+    local pg=getPG(); if not pg then return nil end
+    local c=pg:FindFirstChild("ComponentsHolder"); if not c then return nil end
+    local frame=c:FindFirstChild("DialogueFrame")
+    local npc=frame and frame:FindFirstChild("NpcName",true)
+    if not (npc and string.find(low(npc.Text),"kasugai crow",1,true)) then return nil end
+    local dc=c:FindFirstChild("DialogueContent")
+    local inner=dc and dc:FindFirstChild("InnerHolder",true)
+    if not inner then return nil end
+    return {frame=frame,content=dc,inner=inner,npc=npc}
+end
+local function footerInfo(menu)
+    local current,maxn,seconds=nil,nil,nil
+    if not menu or not menu.content then return current,maxn,seconds end
+    for _,d in ipairs(menu.content:GetDescendants()) do
+        if d:IsA("TextLabel") or d:IsA("TextButton") then
+            local text=trim(d.Text)
+            local a,b=string.match(text,"(%d+)%s*/%s*(%d+)")
+            if a and b then current,maxn=tonumber(a),tonumber(b) end
+            local sec=string.match(low(text),"next mission in.-(%d+)%s*s")
+            if sec then seconds=tonumber(sec) end
+        end
+    end
+    return current,maxn,seconds
+end
+local function findValue(parent,name)
+    local x=parent and parent:FindFirstChild(name)
+    if x and x:IsA("ValueBase") then return x.Value end
+    return nil
+end
+local function activeQuest()
+    local SCH=RAVYN.RuntimeSchema
+    local root=SCH and SCH.get and SCH.get().nodes.sectionRoot
+    local quests=root and root:FindFirstChild("Quests")
+    local holder=quests and quests:FindFirstChild("Holder")
+    if holder then
+        local list=holder:GetChildren()
+        table.sort(list,function(a,b) return a.Name<b.Name end)
+        for _,q in ipairs(list) do
+            local target=nil; local progress=nil; local required=nil
+            local tasks=q:FindFirstChild("Tasks")
+            if tasks then
+                for _,t in ipairs(tasks:GetChildren()) do
+                    local code=findValue(t,"Code")
+                    if code~=nil and tostring(code)~="" then target=tostring(code) end
+                    local v=findValue(t,"Value"); local m=findValue(t,"Max")
+                    if type(v)=="number" then progress=v end
+                    if type(m)=="number" then required=m end
+                    if target then break end
+                end
+            end
+            local qs=findValue(q,"QuestString")
+            if not target then
+                local text=trim(qs or q.Name)
+                target=string.match(text,"[Dd]efeat%s+(.+)") or string.match(text,"[Ee]liminate%s+(.+)")
+            end
+            return {id=q:GetFullName(),name=q.Name,target=trim(target),progress=progress,required=required,inst=q}
+        end
+    end
+    -- GUI fallback if slot data is temporarily unavailable.
+    local pg=getPG(); local c=pg and pg:FindFirstChild("ComponentsHolder"); local l=c and c:FindFirstChild("LeftCenterFramesHolder")
+    local z=l and l:FindFirstChild("zQuestsFrame")
+    if z then
+        local joined={}
+        for _,d in ipairs(z:GetDescendants()) do
+            if d:IsA("TextLabel") or d:IsA("TextButton") then
+                local t=trim(d.Text); if t~="" then table.insert(joined,t) end
+            end
+        end
+        local all=table.concat(joined," | ")
+        local target=string.match(all,"Defeat%s+([%w%s%-_]+)%s+%d+/%d+") or string.match(all,"Eliminate%s+([%w%s%-_]+)%s+%d+/%d+")
+        if target then
+            local a,b=string.match(all,"(%d+)%s*/%s*(%d+)")
+            return {id="GUI:"..trim(target),name="GUI Quest",target=trim(target),progress=tonumber(a),required=tonumber(b),gui=true}
+        end
+    end
+    return nil
+end
+local function vecFromInstance(inst)
+    if not inst then return nil end
+    local attrs=inst:GetAttributes()
+    for _,k in ipairs({"Center","Position","SpawnPosition","Spawn","Location"}) do
+        if typeof(attrs[k])=="Vector3" then return attrs[k] end
+    end
+    for _,k in ipairs({"Center","Position","SpawnPosition","Spawn","Location"}) do
+        local v=inst:FindFirstChild(k)
+        if v and v:IsA("Vector3Value") then return v.Value end
+    end
+    return nil
+end
+-- v1.1: snapshot positions are {x,y,z} tables; every destination is normalised to Vector3 before arithmetic.
+local function toV3(p)
+    if typeof(p)=="Vector3" then return p end
+    if type(p)=="table" and type(p.x)=="number" and type(p.y)=="number" and type(p.z)=="number" then return Vector3.new(p.x,p.y,p.z) end
+    return nil
+end
+CD.toV3=toV3
+local function resolveCenter(target)
+    target=trim(target); if target=="" then return nil end
+    -- 1) streamed runtime entity: always the LIVE position (never cached, so a wandering boss is never chased to a stale spot)
+    for _,e in ipairs((RAVYN.Features and RAVYN.Features.snapshot and RAVYN.Features.snapshot.npcs) or {}) do
+        if e and e.name==target and e.position and e.alive~=false then local v=toV3(e.position); if v then return v end end
+    end
+    local cached=CD.centerCache[target]
+    if cached then return cached end
+    -- 2) remembered live boss position (not cached: it updates whenever the boss is seen again).
+    local bm=RAVYN.BossMeta and RAVYN.BossMeta.byName and RAVYN.BossMeta.byName[target]
+    if bm and bm.lastPos then local v=toV3(bm.lastPos); if v then return v end end
+    -- 3) static replicated Boss Hunts content. Read attributes/ValueBases only; never require modules.
+    -- Prefer the small Boss Hunts subtree; only fall back to a bounded Ouwland scan if the schema moves.
+    local SCH=RAVYN.RuntimeSchema
+    local sn=SCH and SCH.get and SCH.get().nodes.npcs
+    local bossHunts=sn and sn:FindFirstChild("Boss Hunts")
+    local content=RS:FindFirstChild("Ouwland") and RS.Ouwland:FindFirstChild("Content")
+    local roots={}
+    if bossHunts then table.insert(roots,{inst=bossHunts,limit=1200}) end
+    if content then table.insert(roots,{inst=content,limit=3000}) end
+    for _,rec in ipairs(roots) do
+        local count=0
+        for _,d in ipairs(rec.inst:GetDescendants()) do
+            count=count+1; if count>rec.limit then break end
+            local npcCode=d:GetAttribute("NpcCode")
+            if d.Name==target or tostring(npcCode or "")==target then
+                local p=vecFromInstance(d)
+                if not p then
+                    local cur=d.Parent
+                    for _=1,4 do if not cur then break end; p=vecFromInstance(cur); if p then break end; cur=cur.Parent end
+                end
+                if not p then
+                    for i,x in ipairs(d:GetDescendants()) do
+                        if i>100 then break end
+                        p=vecFromInstance(x); if p then break end
+                    end
+                end
+                if p then CD.centerCache[target]=p; return p end
+            end
+        end
+    end
+    return nil
+end
+local function missionRows(menu)
+    local out={}
+    if not menu then return out end
+    for _,row in ipairs(menu.inner:GetChildren()) do
+        if string.match(row.Name,"^Hunt%d+") then
+            local claim=row:FindFirstChild("Claim",true)
+            local questText=nil
+            for _,d in ipairs(row:GetDescendants()) do
+                if d:IsA("TextLabel") or d:IsA("TextButton") then
+                    local t=trim(d.Text)
+                    if string.find(low(t),"defeat ",1,true) then questText=t; break end
+                end
+            end
+            local target=questText and trim(string.match(questText,"[Dd]efeat%s+(.+)") or "") or ""
+            if claim and claim:IsA("GuiButton") and target~="" then
+                table.insert(out,{row=row,claim=claim,quest=questText,target=target})
+            end
+        end
+    end
+    CD.missionsSeen=#out
+    return out
+end
+local function scoreMission(m)
+    local root=rootPart()
+    local streamed=false; local pos=nil
+    for _,e in ipairs((RAVYN.Features and RAVYN.Features.snapshot and RAVYN.Features.snapshot.npcs) or {}) do
+        if e and e.name==m.target and e.alive~=false then streamed=true; pos=e.position; break end
+    end
+    pos=pos or resolveCenter(m.target)
+    local d=(root and pos) and (root.Position-pos).Magnitude or math.huge
+    m.center=pos; m.distance=d
+    return (streamed and 1000000 or 0) + (pos and 100000 or 0) - math.min(d,99999)
+end
+local function chooseMission(menu)
+    local rows=missionRows(menu); local best,bestScore=nil,-math.huge
+    for _,m in ipairs(rows) do
+        local s=scoreMission(m)
+        if not cfg().PreferNearest then s=0-tonumber(string.match(m.row.Name,"%d+") or 999) end
+        if s>bestScore then best,bestScore=m,s end
+    end
+    return best
+end
+local function suppressGeneric(v)
+    local ai=RAVYN.Config.AdaptiveIntel
+    if not ai then return end
+    if v then
+        if CD.savedAutoQuestSources==nil then CD.savedAutoQuestSources=ai.AutoQuestSources end
+        ai.AutoQuestSources=false
+    elseif CD.savedAutoQuestSources~=nil then
+        ai.AutoQuestSources=CD.savedAutoQuestSources; CD.savedAutoQuestSources=nil
+    end
+end
+CD.resolveCenter=resolveCenter
+local function travelTarget(target)
+    -- v1.1: objective travel has ONE authority (DirectCore). Crow only reports the result.
+    local D=RAVYN.Direct
+    if D and D.travelToObjective then
+        local okD,okT,why=pcall(D.travelToObjective,target,"CROW")
+        if okD then local p=resolveCenter(target); if p then CD.lastCenter=p end; return okT,why end
+    end
+    local pos=resolveCenter(target)
+    if not pos or not requestTravel then return false,"TARGET_CENTER_UNRESOLVED" end
+    local root=rootPart(); local d=root and (root.Position-pos).Magnitude or math.huge
+    CD.lastCenter=pos
+    if d<=(cfg().ReTeleportDistance or 80) then return true,"NEAR_TARGET" end
+    local y=(RAVYN.Config.TravelController and RAVYN.Config.TravelController.ArriveHeight) or cfg().TargetArrivalHeight or 5.5
+    CD.lastTravelAt=os.clock()
+    local r=requestTravel(pos+Vector3.new(0,y,0),"CROW "..target,"crow:"..target,.8)
+    return r and r.ok~=false,r and r.code or "TRAVEL_SENT"
+end
+local function openCrow(now)
+    local menu=crowMenu()
+    if menu then return menu end
+    if now-CD.lastOpenAt<(cfg().OpenCooldown or 2.5) then return nil end
+    if RAVYN.LootController and RAVYN.LootController.active then setStatus("WAITING_LOOT","Boss loot has priority"); return nil end
+    if CTX["LiveAction"] and CTX["LiveAction"].target then setStatus("WAITING_COMBAT","Waiting for current fight to finish"); return nil end
+    local btn=toolbarCrowButton()
+    if not btn then setStatus("CROW_TOOL_NOT_FOUND","Toolbar slot 5 is not available"); return nil end
+    CD.lastOpenAt=now
+    local ok,why=clickCenter(btn)
+    setStatus(ok and "OPENING_CROW" or "OPEN_FAILED",ok and "Opening Kasugai Crow" or why)
+    return nil
+end
+local function acceptFromMenu(menu,now)
+    local current,maxn,seconds=footerInfo(menu)
+    CD.dailyCurrent,CD.dailyMax=current,maxn
+    if current and maxn and current>=maxn then
+        CD.dailyComplete=true; suppressGeneric(false); setStatus("DAILY_COMPLETE",string.format("Crow missions %d/%d complete",current,maxn)); return
+    end
+    if seconds and seconds>0 then
+        CD.waitUntil=math.max(CD.waitUntil,now+seconds+.25)
+        setStatus("COOLDOWN","Next Crow mission in "..seconds.."s"); return
+    end
+    if now-CD.lastAcceptAt<(cfg().AcceptCooldown or 1) then return end
+    local m=chooseMission(menu)
+    if not m then setStatus("NO_HUNT_AVAILABLE","Crow menu open, no claimable Hunt row yet"); return end
+    CD.lastAcceptAt=now
+    local before=activeQuest()
+    local ok,why=clickCenter(m.claim)
+    if ok then
+        CD.pending={target=m.target,quest=m.quest,at=now,before=before and before.id or nil,center=m.center}
+        setStatus("ACCEPTING","Claiming "..m.quest)
+    else setStatus("ACCEPT_FAILED",why) end
+end
+local function tick()
+    if not running() then
+        suppressGeneric(false)
+        if CD.status~="READY" and CD.status~="STOPPED" then setStatus("READY","Waiting for RAVYN GO") end
+        return
+    end
+    local now=os.clock()
+    local q=activeQuest()
+    if q then
+        suppressGeneric(false)
+        if CD.pending then
+            local same=(q.target==CD.pending.target) or (q.id~=CD.pending.before)
+            if same then
+                CD.accepted=CD.accepted+1
+                log("Mission accepted · "..tostring(q.target),"success")
+                CD.pending=nil
+            elseif now-CD.pending.at>(cfg().AcceptVerifyTimeout or 3) then
+                log("Claim click did not create the expected quest","warn"); CD.pending=nil; CD.waitUntil=now+2
+            end
+        end
+        if CD.lastQuestId and q.id~=CD.lastQuestId then CD.completed=CD.completed+1 end
+        CD.lastQuestId=q.id; CD.lastQuestTarget=q.target; CD.lastTarget=q.target
+        if q.target and q.target~="" then
+            local ok,why=travelTarget(q.target)
+            setStatus(ok and "ACTIVE" or "TARGET_UNRESOLVED",
+                string.format("%s%s%s",q.target,q.progress and (" · "..q.progress.."/"..tostring(q.required or "?")) or "",ok and "" or (" · "..why)))
+        else setStatus("ACTIVE","Crow quest active") end
+        return
+    end
+    -- no quest: if one existed previously, completion/expiry is observed from local quest data disappearing.
+    if CD.lastQuestId then
+        CD.completed=CD.completed+1
+        log("Quest left active data · ready for next Crow mission","success")
+        CD.lastQuestId=nil; CD.lastQuestTarget=nil; CD.lastTarget=nil
+        CD.waitUntil=math.max(CD.waitUntil,now+1)
+    end
+    if CD.pending then
+        if now-CD.pending.at>(cfg().AcceptVerifyTimeout or 3) then
+            log("Crow claim verification timed out","warn"); CD.pending=nil; CD.waitUntil=now+2
+        else setStatus("VERIFYING_ACCEPT","Waiting for quest data"); return end
+    end
+    if CD.dailyComplete then suppressGeneric(false); return end
+    if now<CD.waitUntil then suppressGeneric(true); setStatus("COOLDOWN",string.format("Crow wait %.0fs",math.max(0,CD.waitUntil-now))); return end
+    suppressGeneric(true)
+    local menu=crowMenu()
+    if not menu then openCrow(now); return end
+    setStatus("READING_HUNTS","Kasugai Crow mission list")
+    acceptFromMenu(menu,now)
+end
+
+function RAVYN:GetCrowDirectStatus()
+    return result(true,"CROW_DIRECT_STATUS",{
+        status=CD.status,detail=CD.detail,missionsSeen=CD.missionsSeen,accepted=CD.accepted,completed=CD.completed,
+        target=CD.lastTarget,dailyCurrent=CD.dailyCurrent,dailyMax=CD.dailyMax,dailyComplete=CD.dailyComplete,
+        wait=math.max(0,(CD.waitUntil or 0)-os.clock()),center=CD.lastCenter,
+    })
+end
+function RAVYN:ResetCrowDaily()
+    CD.dailyComplete=false; CD.dailyCurrent=nil; CD.dailyMax=nil; CD.waitUntil=0
+    return result(true,"CROW_RESET")
+end
+
+-- Human-reviewed live evidence: promote only the parts actually established.
+local GK=RAVYN.GameKnowledge
+if GK and GK.capabilities and GK.capabilities.CROW_MISSION then
+    local c=GK.capabilities.CROW_MISSION
+    c.status="PARTIAL"
+    c.evidence="Live traces #002/#004: toolbar slot 5 opened Kasugai Crow; Hunt5.Claim→Eliminate Datai and Hunt10.Claim→Eliminate Enru in local quest data within ~0.1s"
+    c.detail="Mission open/claim mapped; completion/loot remains handled by generic quest/combat/loot state"
+end
+if GK and GK.systems and GK.systems.CROW_MISSION then
+    local s=GK.systems.CROW_MISSION
+    s.status="PARTIAL"
+    s.start="LIVE: toolbar SkillHolder.5_ToolPosition opens Kasugai Crow; Hunt*.Claim creates local quest data"
+    s.startVerify="LIVE: DATA:Quests.Holder.Eliminate <target> + zQuestsFrame"
+    s.paths="LIVE: ComponentsHolder.DialogueContent...InnerHolder.Hunt*.Claim · local slot Quests.Holder"
+    s.unknown="explicit completion/turn-in semantics; controller treats quest disappearance as completion and reopens Crow"
+end
+local FR=RAVYN.FeatureRegistry
+if FR and FR.features and FR.features.CROW then
+    FR.features.CROW.action="PARTIAL"
+    FR.features.CROW.actionEvidence="Two reviewed live claims: Hunt5→Datai, Hunt10→Enru"
+    FR.features.CROW.verify="PARTIAL"
+    FR.features.CROW.verifyEvidence="Claim produced local quest data + quest GUI"
+end
+
+-- lightweight controller loop; no Workspace polling and no UniversalTrace hooks.
+local token=0
+local function startLoop()
+    token=token+1; local mine=token
+    task.spawn(function()
+        while token==mine and RAVYN and not RAVYN._destroyed do
+            local ok,err=pcall(tick)
+            if not ok and RAVYN.Logger then RAVYN.Logger:log("WARN","CROW_DIRECT_TICK",{error=tostring(err)}) end
+            task.wait(cfg().TickInterval or .35)
+        end
+    end)
+end
+startLoop()
+
+local baseStop=RAVYN.Stop
+function RAVYN:Stop()
+    suppressGeneric(false); CD.pending=nil; CD.waitUntil=0; setStatus("STOPPED","Stopped")
+    return baseStop(self)
+end
+local baseDestroy=RAVYN.Destroy
+function RAVYN:Destroy()
+    token=token+1; suppressGeneric(false); CD.pending=nil
+    return baseDestroy(self)
+end
+CTX["CrowDirect393"]=CD
+RAVYN.Logger:log("INFO","CROW_DIRECT_V393_READY")
+return true]==========]); if not ok then return end end
+do local ok=runChunk("DirectCoreV11.lua",[==========[local G=(getgenv and getgenv()) or _G
+local CTX=G.__RAVYN_CTX
+local Util=CTX["Util"]
+local Config=CTX["Config"]
+local result=CTX["result"]
+local RAVYN=CTX["RAVYN"]
+local LiveAction=CTX["LiveAction"]
+local liveRoot=CTX["liveRoot"]
+local requestTravel=CTX["requestTravel384"]
+local targetAllowed=CTX["targetAllowed"]
+local H=CTX["H"]
+-- RAVYN DIRECT v1.1 · DirectCore
+-- One authority for: objective (from LOCAL quest data), objective travel, target override, generation tokens,
+-- and the lean read path. No remotes, no require(), no other player's data, no hard-coded save slot.
+RAVYN.Version="Direct-v1.2.2-silentcombat-hardening"
+RAVYN.Build="2026-09-28-direct-v1.2.2"
+
+local defaults={
+    FollowQuestData=true,      -- an active local quest objective drives targeting while Auto Play runs
+    ObjectiveInterval=.5,      -- local quest data read cadence (few children, no GUI scan)
+    ObjectiveArriveHeight=6,
+    ObjectiveStreamWait=8,     -- seconds at the last known spot before the objective location is backed off
+    ObjectiveTravelBackoff=15,
+}
+Config.Default.Direct=Util.deepCopy(defaults)
+RAVYN.Config.Direct=Util.deepMerge(defaults,RAVYN.Config.Direct or {})
+local function dc() return RAVYN.Config.Direct end
+
+local D={objective=nil,state="OFF",detail="",gens={},quests={},questError=nil,lastQuestRead=-math.huge,
+    travel={},events={},perf={leanScans=0,fullScans=0},appliedOverride=nil,schemaRebuildAt=-math.huge}
+RAVYN.Direct=D
+
+-- ================= generation / session tokens =================
+-- kinds: target · respawn · stop · objective · loot · boss · muzan · training · esp
+function D.bump(kind) D.gens[kind]=(D.gens[kind] or 0)+1; return D.gens[kind] end
+function D.gen(kind) return D.gens[kind] or 0 end
+function D.live(kind,tok) return not RAVYN._destroyed and (D.gens[kind] or 0)==tok end
+local function event(text,kind)
+    table.insert(D.events,{at=os.clock(),text=text,kind=kind or "info"})
+    while #D.events>30 do table.remove(D.events,1) end
+    if RAVYN.Logger then RAVYN.Logger:log("INFO","QUEST · "..text,{}) end
+end
+D.event=event
+
+-- ================= shared helpers =================
+function D.running() return RAVYN.FSM~=nil and RAVYN.FSM.state=="RUNNING" end
+function D.toV3(p)
+    if typeof(p)=="Vector3" then return p end
+    if type(p)=="table" and type(p.x)=="number" and type(p.y)=="number" and type(p.z)=="number" then return Vector3.new(p.x,p.y,p.z) end
+    return nil
+end
+local toV3=D.toV3
+local function lower(v) return string.lower(tostring(v or "")) end
+local function trim(v)
+    v=tostring(v or ""); v=string.gsub(v,"<.->",""); v=string.gsub(v,"^%s+",""); v=string.gsub(v,"%s+$","")
+    return v
+end
+D.trim=trim
+-- nearest streamed, alive entity with this exact name (case-insensitive fallback)
+function D.findEntity(name)
+    if not name or name=="" then return nil end
+    local s=RAVYN.Features and RAVYN.Features.snapshot or {}
+    local best,bd=nil,math.huge; local ln=lower(name)
+    for _,e in ipairs(s.npcs or {}) do
+        if e.position and e.alive~=false and (tonumber(e.health) or 1)>0 and (e.name==name or lower(e.name)==ln) then
+            local d=e.distance or math.huge
+            if d<bd then best,bd=e,d end
+        end
+    end
+    return best
+end
+-- Explicit targets (a quest objective you accepted, a boss you selected) are not filtered by the automatic risk
+-- rating; NeverAttack and civilian rules still apply. Rules are relaxed only for the duration of the call.
+function D.withExplicitRules(fn,...)
+    local r=RAVYN.Config.Intelligence and RAVYN.Config.Intelligence.TargetRules
+    if not r then return fn(...) end
+    local sm,sb=r.RiskMode,r.SkipBossTooStrong
+    r.RiskMode="Any"; r.SkipBossTooStrong=false
+    local res=table.pack(pcall(fn,...))
+    r.RiskMode=sm; r.SkipBossTooStrong=sb
+    if not res[1] then error(res[2]) end
+    return table.unpack(res,2,res.n)
+end
+-- common activity vocabulary: OFF · READY · SEARCHING · TRAVELING · FIGHTING · LOOTING · COOLDOWN · UNAVAILABLE
+function D.activity(name)
+    if not D.running() then return "READY" end
+    local LC=RAVYN.LootController; if LC and LC.active then return "LOOTING" end
+    local t=LiveAction.target
+    if t and (not name or t.name==name) then
+        local MO=RAVYN.MoveOwner
+        if MO and MO.current=="TRAVEL" then return "TRAVELING" end
+        return "FIGHTING"
+    end
+    local MO=RAVYN.MoveOwner
+    if MO and MO.current=="TRAVEL" then return "TRAVELING" end
+    return "SEARCHING"
+end
+
+-- ================= lean read path (release) =================
+-- The v3.4 read scan also walked the whole PlayerGui for quest names, read minimap pins, level/xp and up to 60
+-- entity detail structures on every 0.3 s tick. Normal play only needs player + NPC state; the full report stays
+-- available in Developer Mode and through "Run live read scan".
+local fullRefresh=RAVYN.RefreshReadBindings
+function RAVYN:RefreshReadBindings(full)
+    if full==true or (self.Config.UI and self.Config.UI.DeveloperMode==true) then
+        D.perf.fullScans=D.perf.fullScans+1
+        return fullRefresh(self)
+    end
+    if self._destroyed then return result(false,"DESTROYED") end
+    local ok,r=pcall(function()
+        local a=self.ReadAdapter
+        local health=a:getHealth(); local max=a:getMaxHealth(); local root=a:getRootPart(); local char=a:getCharacter(); local entities=a:getNpcEntities()
+        local s={player={health=health.ok and health.value or nil,maxHealth=max.ok and max.value or nil,
+            position=root.ok and H.xyz(H.readProp(root.value,"Position")) or nil,characterId=char.ok and H.pathOf(char.value) or nil,
+            characterValid=char.ok,rootValid=root.ok},npcs=entities.ok and entities.value or {},mobs={},bosses={}}
+        if health.ok and max.ok and max.value>0 then s.player.healthPercent=health.value/max.value*100; s.player.dead=health.value<=0 end
+        for _,e in ipairs(s.npcs) do
+            if e.classification=="BOSS" then table.insert(s.bosses,e) elseif e.classification=="NORMAL_MOB" then table.insert(s.mobs,e) end
+        end
+        self.Features.snapshot=s
+        D.perf.leanScans=D.perf.leanScans+1; D.snapshotAt=os.clock()
+        return result(true,"READ_SCAN_LEAN")
+    end)
+    if not ok then return result(false,"READ_ERROR",tostring(r)) end
+    return r
+end
+function RAVYN:RunLiveReadScan()
+    local r=self:RefreshReadBindings(true); self:_showReport("BINDING REPORT",r); return r
+end
+
+-- ================= local quest data (Player_Service.Data.<LocalPlayer>.<active slot>.Quests.Holder) =================
+local function val(p,n)
+    local x=p and p:FindFirstChild(n)
+    if x and x:IsA("ValueBase") then local ok,v=pcall(function() return x.Value end); if ok then return v end end
+    return nil
+end
+local function questHolder(now)
+    local SCH=RAVYN.RuntimeSchema
+    if not (SCH and SCH.get) then return nil,"SCHEMA_UNAVAILABLE" end
+    local s=SCH.get()
+    local root=s.nodes and s.nodes.sectionRoot
+    if (not root or not root.Parent) and now-D.schemaRebuildAt>10 then
+        D.schemaRebuildAt=now; pcall(SCH.build,false); root=SCH.nodes and SCH.nodes.sectionRoot
+    end
+    if not root or not root.Parent then return nil,(SCH.slot and SCH.slot.status) or "PLAYER_DATA_NOT_FOUND" end
+    local q=root:FindFirstChild("Quests"); local h=q and q:FindFirstChild("Holder")
+    if not h then return nil,"QUEST_HOLDER_NOT_FOUND" end
+    return h,nil
+end
+local function readQuests(now)
+    local h,why=questHolder(now)
+    if not h then return {},why end
+    local out={}
+    local list=h:GetChildren()
+    table.sort(list,function(a,b) return a.Name<b.Name end)
+    for i,q in ipairs(list) do
+        if i>12 then break end
+        local target,progress,required=nil,nil,nil
+        local tasks=q:FindFirstChild("Tasks")
+        if tasks then
+            for _,t in ipairs(tasks:GetChildren()) do
+                local code=val(t,"Code")
+                if code~=nil and tostring(code)~="" then
+                    target=trim(code)
+                    local v=val(t,"Value"); local m=val(t,"Max")
+                    progress=type(v)=="number" and v or nil; required=type(m)=="number" and m or nil
+                    break
+                end
+            end
+        end
+        local qs=val(q,"QuestString")
+        if not target then
+            local text=trim(qs or q.Name)
+            target=string.match(text,"[Dd]efeat%s+(.+)") or string.match(text,"[Ee]liminate%s+(.+)")
+            target=target and trim(target) or nil
+        end
+        table.insert(out,{id=q:GetFullName(),name=q.Name,quest=trim(qs or q.Name),target=target,progress=progress,required=required})
+    end
+    return out,nil
+end
+D.readQuests=function() return readQuests(os.clock()) end
+
+local function objectiveEnabled()
+    local c=RAVYN.Config
+    if not dc().FollowQuestData then return false end
+    if c.Intelligence and c.Intelligence.AutoPlay then return true end
+    return false
+end
+D.objectiveEnabled=objectiveEnabled
+local function sourceOf(q)
+    local CD=RAVYN.CrowDirect
+    if CD and ((CD.lastQuestTarget and CD.lastQuestTarget==q.target) or (CD.pending and CD.pending.target==q.target)) then return "CROW" end
+    local n=lower(q.name).." "..lower(q.quest)
+    if string.find(n,"muzan",1,true) then return "MUZAN" end
+    if string.find(n,"eliminate",1,true) then return "HUNT" end -- Boss Hunt claims create "Eliminate <boss>" (live traces #002/#004)
+    return "QUEST"
+end
+
+-- ================= objective travel (single authority) =================
+-- returns ok, code. Never teleports when the target is already engaged or streamed (targeting + ownership handle it).
+function D.travelToObjective(name,source)
+    name=trim(name); if name=="" then return false,"NO_TARGET" end
+    local now=os.clock()
+    local tr=D.travel[name] or {}; D.travel[name]=tr
+    if tr.lastCall and now-tr.lastCall<.2 then return tr.ok,tr.code end
+    tr.lastCall=now
+    local function done(ok,code) tr.ok=ok; tr.code=code; return ok,code end
+    local t=LiveAction.target
+    if t and t.name==name then return done(true,"ENGAGED") end
+    local LC=RAVYN.LootController
+    if LC and LC.active then return done(true,"LOOT_FIRST") end
+    -- external callers (Crow) only move the character for the objective DirectCore currently holds
+    -- (a completed/turned-in quest target is never travelled to again)
+    if source~="OBJECTIVE" and objectiveEnabled() then
+        local ob=D.objective
+        if not ob or ob.name~=name then return done(true,"NOT_CURRENT_OBJECTIVE") end
+    end
+    local e=D.findEntity(name)
+    if e then tr.arrivedAt=nil; return done(true,"STREAMED") end
+    if (tr.backoffUntil or 0)>now then return done(false,"LOCATION_BACKOFF") end
+    local dest=nil
+    local CD=RAVYN.CrowDirect
+    if CD and CD.resolveCenter then local okC,p=pcall(CD.resolveCenter,name); if okC then dest=toV3(p) end end
+    if not dest then
+        local bm=RAVYN.BossMeta and RAVYN.BossMeta.byName and RAVYN.BossMeta.byName[name]
+        dest=bm and toV3(bm.lastPos) or nil
+    end
+    if not dest then return done(false,"TARGET_LOCATION_UNKNOWN") end
+    local root=liveRoot(); if not root then return done(false,"NO_ROOT") end
+    local d=(root.Position-dest).Magnitude
+    if d<=30 then
+        tr.arrivedAt=tr.arrivedAt or now
+        if now-tr.arrivedAt>(dc().ObjectiveStreamWait or 8) then
+            tr.backoffUntil=now+(dc().ObjectiveTravelBackoff or 15); tr.arrivedAt=nil
+            event(name.." not found at its last known spot · retrying later","warn")
+            return done(false,"NOT_FOUND_AT_LAST_KNOWN_SPOT")
+        end
+        return done(true,"WAITING_FOR_STREAM")
+    end
+    tr.arrivedAt=nil
+    if not requestTravel then return done(false,"TRAVEL_UNAVAILABLE") end
+    local r=requestTravel(dest+Vector3.new(0,dc().ObjectiveArriveHeight or 6,0),"OBJECTIVE "..name,"obj:"..name,.8)
+    return done(r~=nil and r.ok~=false,r and r.code or "TRAVEL_SENT")
+end
+
+-- ================= objective tick =================
+local function objectiveTick(now)
+    if not objectiveEnabled() then
+        if D.objective then D.objective=nil; D.bump("objective") end
+        D.state="OFF"; D.detail="Starts with Auto Play / START RAVYN"
+        return
+    end
+    if now-D.lastQuestRead>=(dc().ObjectiveInterval or .5) then
+        D.lastQuestRead=now
+        local list,err=readQuests(now); D.quests=list; D.questError=err
+    end
+    local pick=nil
+    for _,q in ipairs(D.quests) do
+        local complete=q.progress~=nil and q.required~=nil and q.required>0 and q.progress>=q.required
+        if q.target and q.target~="" and not complete then pick=q; break end
+    end
+    if not pick then
+        if D.objective then event("Objective cleared · "..tostring(D.objective.name),"success"); D.objective=nil; D.bump("objective") end
+        D.state=D.running() and "SEARCHING" or "READY"
+        D.detail=D.questError and ("Quest data: "..tostring(D.questError)) or "No active quest objective"
+        return
+    end
+    local ob=D.objective
+    if not ob or ob.id~=pick.id or ob.name~=pick.target then
+        D.bump("objective")
+        ob={id=pick.id,name=pick.target,quest=pick.quest,questName=pick.name,source=sourceOf(pick),since=now}
+        D.objective=ob
+        event("Objective · "..ob.source.." · "..ob.name,"info")
+    end
+    ob.progress=pick.progress; ob.required=pick.required
+    local e=D.findEntity(ob.name)
+    ob.entity=e; ob.streamed=e~=nil
+    if e then ob.parked=false; ob.lostSince=nil end
+    if e then
+        ob.boss=e.isBoss==true or e.classification=="BOSS"
+        local okA,allowed,why=pcall(D.withExplicitRules,targetAllowed,e,ob.boss and "BOSS" or "MOB")
+        ob.blocked=(okA and not allowed) and tostring(why) or nil
+    else ob.blocked=nil end
+    if not D.running() then D.state="READY"; D.detail=ob.name; return end
+    if ob.blocked then D.state="UNAVAILABLE"; D.detail=ob.name.." · skipped by target rules ("..ob.blocked..")"; return end
+    if not ob.streamed then
+        local LC=RAVYN.LootController
+        if LC and LC.active then D.state="LOOTING"; D.detail="Collecting loot before "..ob.name; return end
+        local okT,code=D.travelToObjective(ob.name,ob.source)
+        ob.travelCode=code
+        local lost=code=="TARGET_LOCATION_UNKNOWN" or code=="LOCATION_BACKOFF" or code=="NOT_FOUND_AT_LAST_KNOWN_SPOT"
+        if lost then
+            -- an objective whose target cannot be located (e.g. a non-NPC task code) must not freeze all other work:
+            -- after 20 s it is parked (still shown) and normal farming resumes until the target appears.
+            ob.lostSince=ob.lostSince or now
+            if not ob.parked and now-ob.lostSince>20 then ob.parked=true; event(ob.name.." not found in the world · continuing other work","warn") end
+            D.state="SEARCHING"
+        else ob.lostSince=nil; D.state="TRAVELING" end
+        D.detail=ob.name.." · "..(ob.parked and "parked, target not in world" or string.lower(string.gsub(tostring(code),"_"," ")))
+        return
+    end
+    D.state=D.activity(ob.name)
+    D.detail=ob.name..(ob.progress and string.format(" · %d/%d",ob.progress,ob.required or 0) or "")
+end
+
+-- ================= target override (applied only for the duration of one automation tick) =================
+function D.targetOverride()
+    local ob=D.objective
+    if ob and ob.streamed and ob.entity and not ob.blocked and objectiveEnabled() then
+        return {name=ob.name,boss=ob.boss==true,source=ob.source,explicit=true}
+    end
+    local BC=RAVYN.BossController
+    if BC and BC.choice and BC.applies and BC.applies() then return {name=BC.choice.name,boss=true,source="BOSS_FARM",explicit=BC.choice.selected==true} end
+    return nil
+end
+local baseTick=RAVYN._tick
+function RAVYN:_tick()
+    local ov=nil
+    local okO,res=pcall(D.targetOverride); if okO then ov=res end
+    local saved=nil
+    if ov then
+        saved={mode=self.Config.AutoPlayV38.Mode,mob=self.Config.Farm.NormalMobs.TargetName,boss=self.Config.Farm.Boss.TargetName}
+        if self.Config.Intelligence.AutoPlay then self.Config.AutoPlayV38.Mode=ov.boss and "Bosses" or "Mobs" end
+        if ov.boss then self.Config.Farm.Boss.TargetName=ov.name else self.Config.Farm.NormalMobs.TargetName=ov.name end
+    end
+    D.appliedOverride=ov
+    local ok,err
+    if ov and ov.explicit then ok,err=pcall(D.withExplicitRules,baseTick,self) else ok,err=pcall(baseTick,self) end
+    if saved then self.Config.AutoPlayV38.Mode=saved.mode; self.Config.Farm.NormalMobs.TargetName=saved.mob; self.Config.Farm.Boss.TargetName=saved.boss end
+    -- target change token
+    local tid=LiveAction.targetId
+    if tid~=D.lastTargetId then D.lastTargetId=tid; D.bump("target") end
+    if not ok then error(err) end
+end
+
+-- ================= lifecycle =================
+D.token=(D.token or 0)+1
+local token=D.token
+task.spawn(function()
+    while not RAVYN._destroyed and D.token==token do
+        local ok,err=pcall(objectiveTick,os.clock())
+        if not ok then D.detail="DIRECT_TICK_ERROR"; RAVYN.Logger:log("ERROR","DIRECT_TICK",{error=tostring(err)}) end
+        task.wait(.25)
+    end
+end)
+do
+    local p=game:GetService("Players").LocalPlayer
+    if p then table.insert(RAVYN._connections,p.CharacterAdded:Connect(function() D.bump("respawn"); D.travel={} end)) end
+end
+local baseStop=RAVYN.Stop
+function RAVYN:Stop()
+    D.bump("stop"); D.bump("objective"); D.objective=nil; D.travel={}; D.appliedOverride=nil
+    D.state="OFF"; D.detail="Stopped"
+    return baseStop(self)
+end
+local baseDestroy=RAVYN.Destroy
+function RAVYN:Destroy()
+    D.token=D.token+1; for k in pairs(D.gens) do D.gens[k]=D.gens[k]+1 end
+    D.objective=nil; D.travel={}
+    return baseDestroy(self)
+end
+-- Crow Hunts switch: the Direct Crow controller + the objective pipeline that fights the claimed target
+function RAVYN:SetCrowHunts(v)
+    if type(v)~="boolean" then return result(false,"INVALID_CONFIG") end
+    local r=self:SetConfig("CrowDirect.Enabled",v); if not r.ok then return r end
+    if v and not self.Config.Intelligence.AutoPlay then local r2=self:SetAutoPlay(true); if r2 and not r2.ok then return r2 end end
+    if v and self.FSM.state=="STOPPED" then self:Start() end
+    return result(true,v and "CROW_HUNTS_ON" or "CROW_HUNTS_OFF")
+end
+function RAVYN:GetObjectiveStatus()
+    local ob=D.objective
+    return result(true,"OBJECTIVE_STATUS",{state=D.state,detail=D.detail,name=ob and ob.name,source=ob and ob.source,progress=ob and ob.progress,
+        required=ob and ob.required,streamed=ob and ob.streamed,quests=#D.quests,dataError=D.questError})
+end
+CTX["Direct11"]=D
+RAVYN.Logger:log("INFO","DIRECT_CORE_V11_READY")
+return true]==========]); if not ok then return end end
+do local ok=runChunk("BossControllerV11.lua",[==========[local G=(getgenv and getgenv()) or _G
+local CTX=G.__RAVYN_CTX
+local Util=CTX["Util"]
+local Config=CTX["Config"]
+local result=CTX["result"]
+local RAVYN=CTX["RAVYN"]
+local LiveAction=CTX["LiveAction"]
+local Brain=CTX["Brain"]
+local liveRoot=CTX["liveRoot"]
+local requestTravel=CTX["requestTravel384"]
+local targetAllowed=CTX["targetAllowed"]
+local D=CTX["Direct11"]
+-- RAVYN DIRECT v1.1 · BossController
+-- Chooses WHICH boss (single / multi-select / rotation / skip respawning) from the ActiveNpcs + BossInfo reads RAVYN
+-- already uses. Movement stays with TravelController, combat with CombatMobility, loot with LootController.
+local defaults={
+    Enabled=false,
+    Selected={},               -- boss names; empty = any eligible boss
+    Rotation=true,             -- cycle the selection in order after each confirmed kill
+    SkipRespawning=true,
+    RespawnSkipSeconds=45,
+    TravelToRemembered=true,   -- selected boss not streamed → teleport to its last observed position
+    StreamWait=8,
+    UnavailableBackoff=60,
+    ReturnWindow=45,           -- only return after death if this boss was engaged within the window
+}
+Config.Default.BossFarm=Util.deepCopy(defaults)
+RAVYN.Config.BossFarm=Util.deepMerge(defaults,RAVYN.Config.BossFarm or {})
+local function bc() return RAVYN.Config.BossFarm end
+
+local BC={state="OFF",detail="",choice=nil,list={},kills=0,killedAt={},unavailable={},lastKilled=nil,
+    respawnGen=0,lastRespawn=nil,travel=nil,seenResolutions=0,roster={},rosterAt=-math.huge}
+RAVYN.BossController=BC
+
+local function now() return os.clock() end
+local function explicit()
+    local c=RAVYN.Config
+    if bc().Enabled or (c.Farm and c.Farm.Boss and c.Farm.Boss.Enabled) then return true end
+    local GO=RAVYN.GoState
+    return GO~=nil and GO.active and not GO.paused and GO.goal=="BOSS_FARM"
+end
+function BC.applies()
+    if explicit() then return true end
+    local c=RAVYN.Config
+    return c.Intelligence and c.Intelligence.AutoPlay and c.AutoPlayV38 and c.AutoPlayV38.Mode=="Smart" and c.AutoPlayV38.BossRotation==true or false
+end
+BC.explicit=explicit
+local function selectedSet()
+    local set={}; local n=0
+    for _,name in ipairs(bc().Selected or {}) do if type(name)=="string" and name~="" then set[name]=true; n=n+1 end end
+    return set,n
+end
+local function recentlyDown(name,t)
+    local skip=bc().RespawnSkipSeconds or 45
+    if (BC.killedAt[name] or -math.huge)>t-skip then return true end
+    for _,m in pairs((Brain and Brain.bossMemory) or {}) do
+        if m.name==name and m.lastDownAt and t-m.lastDownAt<skip and not m.alive then return true end
+    end
+    return false
+end
+
+-- ---------- roster (streamed + remembered + Boss Hunts content identities) ----------
+local function refreshRoster(t)
+    if t-BC.rosterAt<5 and next(BC.roster) then return end
+    BC.rosterAt=t
+    local r={}
+    for name,m in pairs((RAVYN.BossMeta and RAVYN.BossMeta.byName) or {}) do r[name]={remembered=true,lastPos=m.lastPos,chest=m.chest,onlyAtNight=m.onlyAtNight} end
+    local SCH=RAVYN.RuntimeSchema
+    local ids=SCH and SCH.identities and SCH.identities.crowBossHuntNpcs or {}
+    for _,name in ipairs(ids) do r[name]=r[name] or {content=true} end
+    BC.roster=r
+end
+
+-- ---------- per-tick status list + choice ----------
+local function statusFor(name,e,t,selected)
+    local meta=(RAVYN.BossMeta and RAVYN.BossMeta.byName and RAVYN.BossMeta.byName[name]) or {}
+    local st={name=name,chest=meta.chest,onlyAtNight=meta.onlyAtNight==true,lastPos=meta.lastPos}
+    if e then
+        st.id=e.id; st.distance=e.distance; st.health=e.health; st.maxHealth=e.maxHealth
+        st.hpPct=(e.health and e.maxHealth and e.maxHealth>0) and math.clamp(e.health/e.maxHealth*100,0,100) or nil
+        -- a boss you selected is explicit: only NeverAttack/civilian rules apply, not the automatic risk rating
+        local okA,allowed,why
+        if selected then okA,allowed,why=pcall(D.withExplicitRules,targetAllowed,e,"BOSS") else okA,allowed,why=pcall(targetAllowed,e,"BOSS") end
+        if okA and not allowed then st.status="SKIPPED"; st.reason=tostring(why)
+        else st.status="ALIVE" end
+    elseif recentlyDown(name,t) and bc().SkipRespawning then st.status="RESPAWNING"
+    elseif (BC.unavailable[name] or 0)>t then st.status="UNAVAILABLE"; st.reason="not found at last known spot"
+    elseif st.lastPos then st.status="NOT_STREAMED"
+    else st.status="UNKNOWN_LOCATION" end
+    return st
+end
+local function tick()
+    local t=now()
+    refreshRoster(t)
+    local s=RAVYN.Features and RAVYN.Features.snapshot or {}
+    -- nearest alive streamed boss per name
+    local streamed={}
+    for _,e in ipairs(s.npcs or {}) do
+        if (e.isBoss==true or e.classification=="BOSS") and e.alive~=false and (tonumber(e.health) or 0)>0 and e.position then
+            local cur=streamed[e.name]
+            if not cur or (e.distance or math.huge)<(cur.distance or math.huge) then streamed[e.name]=e end
+        end
+    end
+    -- confirmed kills come from the TargetCombatSession death handoff (AutoPlay384)
+    local AP=RAVYN.AutoPlay384; local Hh=AP and AP.handoff
+    if Hh and (Hh.resolutions or 0)>BC.seenResolutions then
+        BC.seenResolutions=Hh.resolutions or 0
+        if Hh.lastBoss then
+            BC.killedAt[Hh.lastBoss]=t; BC.lastKilled=Hh.lastBoss; BC.kills=BC.kills+1
+            if BC.choice and BC.choice.name==Hh.lastBoss then BC.choice=nil; D.bump("boss") end
+        end
+    end
+    -- status list (selection first, then everything else known)
+    local set,nsel=selectedSet()
+    local names={}; local seen={}
+    for _,n in ipairs(bc().Selected or {}) do if not seen[n] then seen[n]=true; table.insert(names,n) end end
+    local others={}
+    for n in pairs(streamed) do if not seen[n] then seen[n]=true; table.insert(others,n) end end
+    for n in pairs(BC.roster) do if not seen[n] then seen[n]=true; table.insert(others,n) end end
+    table.sort(others)
+    for _,n in ipairs(others) do table.insert(names,n) end
+    local list={}
+    for i,n in ipairs(names) do if i>40 then break end; local st=statusFor(n,streamed[n],t,set[n]==true); st.selected=set[n]==true; table.insert(list,st) end
+    BC.list=list
+    -- choice
+    if not BC.applies() then BC.choice=nil; BC.travel=nil; BC.state="OFF"; BC.detail=""; return end
+    local function usable(st) return st.status=="ALIVE" and (nsel==0 or st.selected) end
+    local cur=BC.choice
+    if cur then
+        local st=nil; for _,x in ipairs(list) do if x.name==cur.name then st=x; break end end
+        if not (st and usable(st)) then cur=nil end
+    end
+    if not cur then
+        local pick=nil
+        if nsel>0 and bc().Rotation then
+            -- rotate: start after the last killed boss in selection order
+            local sel=bc().Selected; local start=1
+            for i,n in ipairs(sel) do if n==BC.lastKilled then start=i+1; break end end
+            for k=0,#sel-1 do
+                local n=sel[((start-1+k)%#sel)+1]
+                for _,x in ipairs(list) do if x.name==n and usable(x) then pick=x; break end end
+                if pick then break end
+            end
+        else
+            local bd=math.huge
+            for _,x in ipairs(list) do if usable(x) and (x.distance or math.huge)<bd then pick,bd=x,x.distance or math.huge end end
+        end
+        if pick then BC.choice={name=pick.name,id=pick.id,since=t,selected=pick.selected==true}; BC.travel=nil; D.bump("boss") end
+        cur=BC.choice
+    end
+    if cur then
+        BC.travel=nil
+        local a=D.activity(cur.name)
+        BC.state=a; BC.detail=cur.name
+        return
+    end
+    -- nothing streamed: explicit boss farm may travel to a selected boss's last observed position
+    -- (a quest objective or a loot session owns travel first: one movement authority at a time)
+    local LCx=RAVYN.LootController
+    local busy=(D.objective~=nil and D.objectiveEnabled()) or (LCx and LCx.active) or LiveAction.target~=nil
+    if explicit() and bc().TravelToRemembered and nsel>0 and D.running() and not busy then
+        local target=nil
+        for _,x in ipairs(list) do if x.selected and x.status=="NOT_STREAMED" and x.lastPos then target=x; break end end
+        if target then
+            local dest=D.toV3(target.lastPos); local root=liveRoot()
+            if dest and root then
+                local tr=BC.travel
+                if not tr or tr.name~=target.name then tr={name=target.name,since=t}; BC.travel=tr end
+                local d=(root.Position-dest).Magnitude
+                if d<=30 then
+                    tr.arrivedAt=tr.arrivedAt or t
+                    if t-tr.arrivedAt>(bc().StreamWait or 8) then
+                        BC.unavailable[target.name]=t+(bc().UnavailableBackoff or 60); BC.travel=nil
+                        D.event(target.name.." not found at last known spot · skipping for now","warn")
+                    end
+                    BC.state="SEARCHING"; BC.detail=target.name.." · waiting for it to appear"
+                else
+                    local h=(RAVYN.Config.CombatMobility and RAVYN.Config.CombatMobility.FlyHeight) or 6
+                    if requestTravel then requestTravel(dest+Vector3.new(0,h,0),"BOSS "..target.name,"boss:"..target.name,.8) end
+                    BC.state="TRAVELING"; BC.detail=target.name.." · last known position"
+                end
+                return
+            end
+        end
+        local cool=false; for _,x in ipairs(list) do if x.selected and x.status=="RESPAWNING" then cool=true end end
+        BC.state=cool and "COOLDOWN" or "SEARCHING"; BC.detail=cool and "Selected bosses are respawning" or "No selected boss available"
+        return
+    end
+    BC.state=D.running() and "SEARCHING" or "READY"; BC.detail=nsel>0 and "Waiting for a selected boss" or "Waiting for any boss"
+end
+
+-- ---------- respawn return (called by TravelController on CharacterAdded) ----------
+function BC.onRespawn(char,boss)
+    BC.respawnGen=BC.respawnGen+1; local gen=BC.respawnGen
+    local tcx=RAVYN.Config.TravelController or {}
+    if not boss or not boss.at or os.clock()-boss.at>(bc().ReturnWindow or 45) then
+        BC.lastRespawn={result="NO_RECENT_BOSS",at=os.clock()}; return
+    end
+    task.spawn(function()
+        local root=char and char:WaitForChild("HumanoidRootPart",12)
+        if not root or gen~=BC.respawnGen or RAVYN._destroyed then return end
+        task.wait(tcx.RespawnReturnDelay or 1.25)
+        if gen~=BC.respawnGen or RAVYN._destroyed or not D.running() then return end
+        pcall(function() RAVYN:RefreshReadBindings() end)
+        local e=nil
+        for _,x in ipairs((RAVYN.Features.snapshot or {}).npcs or {}) do
+            if x.id==boss.id and x.alive~=false and (tonumber(x.health) or 0)>0 and x.position then e=x; break end
+        end
+        if not e and boss.name then e=D.findEntity(boss.name) end
+        if not e or not (e.isBoss==true or e.classification=="BOSS") then
+            BC.lastRespawn={result="BOSS_GONE",boss=boss.name,at=os.clock()}
+            D.event("Respawned · "..tostring(boss.name).." is gone, continuing","info"); return
+        end
+        local pos=D.toV3(e.position); if not pos then return end
+        local h=(RAVYN.Config.CombatMobility and RAVYN.Config.CombatMobility.FlyHeight) or tcx.ArriveHeight or 5.5
+        local MO=RAVYN.MoveOwner; if MO then MO.lastTeleportKey=nil; MO.lastTeleportDest=nil end
+        local r=requestTravel and requestTravel(pos+Vector3.new(0,h,0),"RETURN TO BOSS · "..tostring(e.name),"respawn-boss:"..tostring(e.id),.8)
+        LiveAction.targetId=e.id -- sticky: the same boss is re-acquired first
+        BC.lastRespawn={result=r and r.code or "SENT",boss=e.name,at=os.clock()}
+        if MO then MO.lastRespawnReturn={at=os.clock(),boss=e.name,code=r and r.code} end
+        D.event("Respawned · returning to "..tostring(e.name),"success")
+    end)
+end
+
+-- ---------- public API ----------
+function RAVYN:SetBossFarm(v)
+    if type(v)~="boolean" then return result(false,"INVALID_CONFIG") end
+    local r=self:SetConfig("BossFarm.Enabled",v); if not r.ok then return r end
+    if not self.Config.Intelligence.AutoPlay then
+        local r2=self:SetFeature("BOSS",v); if not r2.ok then return r2 end
+    elseif v and self.FSM.state=="STOPPED" then self:Start() end
+    if not v then BC.choice=nil; BC.travel=nil end
+    return result(true,v and "BOSS_FARM_ON" or "BOSS_FARM_OFF")
+end
+function RAVYN:ToggleBossSelected(name)
+    if type(name)~="string" or name=="" then return result(false,"INVALID_NAME") end
+    local list=Util.deepCopy(self.Config.BossFarm.Selected or {}); local found=nil
+    for i,n in ipairs(list) do if n==name then found=i; break end end
+    if found then table.remove(list,found) else table.insert(list,name) end
+    local r=self:SetConfig("BossFarm.Selected",list)
+    if r.ok then BC.choice=nil end
+    return r.ok and result(true,found and "BOSS_UNSELECTED" or "BOSS_SELECTED",{name=name}) or r
+end
+function RAVYN:ClearBossSelection() BC.choice=nil; return self:SetConfig("BossFarm.Selected",{}) end
+function RAVYN:GetBossFarmStatus()
+    return result(true,"BOSS_FARM_STATUS",{state=BC.state,detail=BC.detail,choice=BC.choice and BC.choice.name,kills=BC.kills,list=BC.list,lastRespawn=BC.lastRespawn})
+end
+
+BC.token=(BC.token or 0)+1
+local token=BC.token
+task.spawn(function()
+    while not RAVYN._destroyed and BC.token==token do
+        local ok,err=pcall(tick)
+        if not ok then BC.detail="BOSS_TICK_ERROR"; RAVYN.Logger:log("ERROR","BOSS_CONTROLLER_TICK",{error=tostring(err)}) end
+        task.wait(.25)
+    end
+end)
+local baseStop=RAVYN.Stop
+function RAVYN:Stop()
+    BC.respawnGen=BC.respawnGen+1; BC.choice=nil; BC.travel=nil; BC.state="OFF"
+    return baseStop(self)
+end
+local baseDestroy=RAVYN.Destroy
+function RAVYN:Destroy() BC.token=BC.token+1; BC.respawnGen=BC.respawnGen+1; BC.choice=nil; return baseDestroy(self) end
+CTX["BossController11"]=BC
+RAVYN.Logger:log("INFO","BOSS_CONTROLLER_V11_READY")
+return true]==========]); if not ok then return end end
+do local ok=runChunk("WorldSystemsV11.lua",[==========[local G=(getgenv and getgenv()) or _G
+local CTX=G.__RAVYN_CTX
+local Util=CTX["Util"]
+local Config=CTX["Config"]
+local result=CTX["result"]
+local RAVYN=CTX["RAVYN"]
+local liveRoot=CTX["liveRoot"]
+local requestTravel=CTX["requestTravel384"]
+local D=CTX["Direct11"]
+-- RAVYN DIRECT v1.1 · Muzan + Training controllers.
+-- Evidence available today: world "Muzan" instance with a ProximityPrompt (FeatureRegistry candidate), QuestStates
+-- "Muzan Quest", Ouwland.Content trainer identities, Workspace.Training stations with ProximityPrompts, the
+-- ComponentsHolder.DialogueFrame.NpcName dialogue path (Crow evidence) and local quest data.
+-- Sub-actions without evidence (Muzan task selection, training minigames) are reported UNAVAILABLE, never invented.
+local Players=game:GetService("Players")
+local LP=Players.LocalPlayer
+local function exec(name) local f=(getgenv and getgenv()[name]) or G[name]; return type(f)=="function" and f or nil end
+local function lower(v) return string.lower(tostring(v or "")) end
+local function posOf(inst)
+    if not inst then return nil end
+    if inst:IsA("BasePart") then return inst.Position end
+    if inst:IsA("Model") then local ok,cf=pcall(function() return inst:GetPivot() end); if ok then return cf.Position end end
+    local bp=inst:FindFirstAncestorWhichIsA("BasePart") or inst:FindFirstChildWhichIsA("BasePart",true)
+    return bp and bp.Position or nil
+end
+local function firstPrompt(inst)
+    if not inst then return nil end
+    local ok,p=pcall(function() return inst:FindFirstChildWhichIsA("ProximityPrompt",true) end)
+    return ok and p or nil
+end
+-- dialogue GUI (same verified path the Crow controller uses)
+local function dialogue()
+    local pg=LP and LP:FindFirstChildOfClass("PlayerGui"); local c=pg and pg:FindFirstChild("ComponentsHolder")
+    local frame=c and c:FindFirstChild("DialogueFrame")
+    local npc=frame and frame:FindFirstChild("NpcName",true)
+    local visible=frame and frame:IsA("GuiObject") and frame.Visible
+    return npc and npc.Text or nil,visible,c and c:FindFirstChild("DialogueContent")
+end
+local function dialogueLines(content,limit)
+    local out={}
+    if not content then return out end
+    local ok,desc=pcall(function() return content:GetDescendants() end)
+    if not ok then return out end
+    for i,d in ipairs(desc) do
+        if i>200 or #out>=(limit or 6) then break end
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible and d.Text~="" then table.insert(out,D.trim(d.Text)) end
+    end
+    return out
+end
+local function firePrompt(pr)
+    local f=exec("fireproximityprompt"); if not f then return false,"FIREPROXIMITYPROMPT_UNAVAILABLE" end
+    local ok=pcall(function() f(pr,math.max(pr.HoldDuration or 0,0)) end)
+    return ok,ok and "PROMPT_SENT" or "PROMPT_ERROR"
+end
+
+-- ================= MUZAN =================
+Config.Default.MuzanDirect={Enabled=false,AutoInteract=false,ScanInterval=10,InteractCooldown=8,VerifyWindow=2.5}
+RAVYN.Config.MuzanDirect=Util.deepMerge(Config.Default.MuzanDirect,RAVYN.Config.MuzanDirect or {})
+local function mc() return RAVYN.Config.MuzanDirect end
+local MZ={state="OFF",detail="",found=nil,lastScan=-math.huge,pending=nil,lastInteract=-math.huge,dialogue={},claimUntil=0,restUntil=0,visitAt=nil,
+    sub={find="READY",teleport="READY",interact="PARTIAL",accept="UNAVAILABLE",objective="PARTIAL",repeatTask="UNAVAILABLE"}}
+RAVYN.MuzanController=MZ
+local function findMuzan(t,force)
+    -- 1) streamed NPC enumeration (ActiveNpcs)
+    for _,name in ipairs({"Muzan","Roaming Muzan"}) do
+        local e=D.findEntity(name)
+        if e then
+            local raw=RAVYN.ReadAdapter and RAVYN.ReadAdapter.lastEntities and RAVYN.ReadAdapter.lastEntities[e.id]
+            return {name=name,pos=D.toV3(e.position),inst=raw,prompt=firstPrompt(raw),via="ActiveNpcs"}
+        end
+    end
+    -- 2) bounded identity lookup (C-side recursive FindFirstChild), at most every ScanInterval seconds
+    if not force and t-MZ.lastScan<(mc().ScanInterval or 10) then return MZ.found end
+    MZ.lastScan=t
+    local ok,inst=pcall(function() return workspace:FindFirstChild("Muzan",true) end)
+    if ok and inst then return {name="Muzan",pos=posOf(inst),inst=inst,prompt=firstPrompt(inst),via="world identity"} end
+    return nil
+end
+local function muzanTick(t)
+    if not mc().Enabled then MZ.state="OFF"; MZ.detail=""; MZ.pending=nil; return end
+    local ob=D.objective
+    if ob and ob.source=="MUZAN" then MZ.state=D.state; MZ.detail="Task · "..tostring(ob.name); MZ.visitAt=nil; return end
+    if ob and D.objectiveEnabled() then MZ.state="READY"; MZ.detail="Current objective first ("..tostring(ob.name)..")"; MZ.visitAt=nil; return end
+    if t<MZ.restUntil then MZ.state="COOLDOWN"; MZ.detail=string.format("Next Muzan visit in %.0fs",MZ.restUntil-t); return end
+    local f=findMuzan(t,false); MZ.found=f
+    if not f or not f.pos then MZ.state="SEARCHING"; MZ.detail="Muzan is not streamed right now"; MZ.sub.find="SEARCHING"; return end
+    MZ.sub.find="READY"
+    local root=liveRoot(); if not root then return end
+    local d=(root.Position-f.pos).Magnitude
+    local reach=(f.prompt and math.max(4,(f.prompt.MaxActivationDistance or 10)-2)) or 8
+    if d>reach then
+        if not D.running() then MZ.state="READY"; MZ.detail=string.format("Muzan found · %.0f studs",d); return end
+        -- one movement authority: never pull the character away from a fight or a loot session
+        local LA=CTX["LiveAction"]; local LC=RAVYN.LootController
+        if (LA and LA.target) or (LC and LC.active) then MZ.state="READY"; MZ.detail="Muzan found · waiting for the current fight/loot"; return end
+        local away=(root.Position-f.pos); away=Vector3.new(away.X,0,away.Z); away=away.Magnitude>1 and away.Unit or Vector3.new(1,0,0)
+        if requestTravel then requestTravel(f.pos+away*math.min(4,reach-1)+Vector3.new(0,2,0),"MUZAN","muzan",.8) end
+        MZ.claimUntil=t+1.2 -- the scheduler holds new target acquisition while Muzan owns travel
+        MZ.state="TRAVELING"; MZ.detail="Going to Muzan"; return
+    end
+    -- a visit is bounded: without progress for 20 s RAVYN resumes other work and comes back later
+    MZ.visitAt=MZ.visitAt or t
+    if t-MZ.visitAt>20 and not MZ.pending then MZ.visitAt=nil; MZ.restUntil=t+90; MZ.state="COOLDOWN"; MZ.detail="No task picked · back in 90 s"; return end
+    MZ.claimUntil=t+1.2
+    local npcText,vis,content=dialogue()
+    if npcText and string.find(lower(npcText),"muzan",1,true) and vis~=false then
+        MZ.dialogue=dialogueLines(content,6); MZ.pending=nil
+        MZ.state="READY"; MZ.detail="Dialogue open · choose the task yourself (selection not mapped)"; return
+    end
+    if MZ.pending then
+        if t-MZ.pending.at>(mc().VerifyWindow or 2.5) then
+            MZ.pending=nil; MZ.lastInteract=t+10; MZ.sub.interact="UNVERIFIED"
+            MZ.state="COOLDOWN"; MZ.detail="Prompt fired but no Muzan dialogue appeared · backing off"
+        end
+        return
+    end
+    if not mc().AutoInteract or not D.running() then MZ.state="READY"; MZ.detail="At Muzan · press the prompt yourself or enable auto interact"; return end
+    if not f.prompt then MZ.state="UNAVAILABLE"; MZ.detail="No interaction prompt on Muzan"; MZ.sub.interact="UNAVAILABLE"; return end
+    if t-MZ.lastInteract<(mc().InteractCooldown or 8) then MZ.state="COOLDOWN"; MZ.detail="Interaction cooldown"; return end
+    MZ.lastInteract=t
+    local ok,code=firePrompt(f.prompt)
+    if ok then MZ.pending={at=t}; MZ.state="READY"; MZ.detail="Opening Muzan dialogue…" else MZ.state="UNAVAILABLE"; MZ.detail=code end
+end
+-- scheduler hold: while Muzan owns travel/visit, no new farm target is acquired (a running fight is never interrupted)
+local Hooks=CTX.Hooks
+local baseChoose=Hooks.chooseMode
+Hooks.chooseMode=function()
+    local LA=CTX["LiveAction"]
+    if mc().Enabled and os.clock()<(MZ.claimUntil or 0) and not (LA and LA.target) then
+        local JS=RAVYN.JobScheduler
+        if JS then JS.job="MUZAN"; JS.label="MUZAN · "..tostring(MZ.detail); JS.allowMovement=false; JS.mode=nil end
+        return nil,false,"MUZAN"
+    end
+    return baseChoose()
+end
+function RAVYN:SetMuzan(key,v)
+    local allowed={Enabled=true,AutoInteract=true}
+    if not allowed[key] or type(v)~="boolean" then return result(false,"INVALID_MUZAN_OPTION") end
+    local r=self:SetConfig("MuzanDirect."..key,v)
+    if r.ok and key=="Enabled" and v and self.FSM.state=="STOPPED" then self:Start() end
+    return r
+end
+function RAVYN:TeleportToMuzan()
+    local f=findMuzan(os.clock(),true); MZ.found=f
+    if not f or not f.pos then return result(false,"MUZAN_NOT_STREAMED") end
+    if not requestTravel then return result(false,"TRAVEL_UNAVAILABLE") end
+    return requestTravel(f.pos+Vector3.new(3,2,0),"MUZAN","muzan-manual",.8)
+end
+
+-- ================= TRAINING =================
+Config.Default.TrainingDirect={SelectedStyle=""}
+RAVYN.Config.TrainingDirect=Util.deepMerge(Config.Default.TrainingDirect,RAVYN.Config.TrainingDirect or {})
+local STYLES={"Flame","Thunder","Water","Wind","Stone","Serpent","Insect","Sound","Moon","Mist","Love","Beast","Sun"}
+local TRAINERS={"Flame","Thunder","Water","Wind","Stone","Serpent","Insect","Sound"}
+local TC={state="READY",detail="",detected=nil,detectedFrom=nil,trainers={},stations={},scannedAt=nil,mastery=nil,masteryAt=-math.huge,pending=nil,
+    sub={select="READY",teleport="READY",interact="PARTIAL",minigame="UNAVAILABLE",progress="PARTIAL"}}
+RAVYN.TrainingController=TC
+TC.TRAINERS=TRAINERS
+local function styleIn(text)
+    local l=lower(text)
+    for _,s in ipairs(STYLES) do
+        local ls=lower(s)
+        if string.find(l,ls.." breath",1,true) or string.find(l,ls.."breath",1,true) then return s end
+    end
+    return nil
+end
+-- equipped style: hotbar skill names first, then local Powers data names (both local-player reads)
+function TC.detect()
+    local A=RAVYN.AdaptiveIntel
+    for _,sk in ipairs((A and A.activeProfile and A.activeProfile.skills) or {}) do
+        local s=styleIn(sk.name); if s then TC.detected=s; TC.detectedFrom="hotbar skill · "..tostring(sk.name); return s end
+    end
+    local DA=RAVYN.DataAdapters
+    if DA and DA.Powers then
+        local ok,tree=pcall(DA.Powers)
+        if ok and type(tree)=="table" then
+            local n=0
+            local function walk(node)
+                n=n+1; if n>300 or TC.detected then return end
+                local s=styleIn(node.name) or (type(node.value)=="string" and styleIn(node.value))
+                if s then TC.detected=s; TC.detectedFrom="player data · Powers"; return end
+                for _,c in pairs(node.children or {}) do walk(c) end
+            end
+            TC.detected=nil; walk(tree)
+            if TC.detected then return TC.detected end
+        end
+    end
+    TC.detected=nil; TC.detectedFrom="not visible (no breathing skill on the hotbar or in Powers)"
+    return nil
+end
+-- on demand only (Training page / buttons): trainer + station lookups are one-shot, never a loop
+function TC.scan()
+    local SCH=RAVYN.RuntimeSchema
+    local content={}
+    if SCH and SCH.get then local s=SCH.get(); content=(s.identities and s.identities.contentIdentity) or {} end
+    for _,t in ipairs(TRAINERS) do
+        local name=t.." Trainer"
+        local ok,inst=pcall(function() return workspace:FindFirstChild(name,true) end)
+        TC.trainers[t]={name=name,identity=content[name]~=nil,inst=ok and inst or nil,pos=(ok and inst) and posOf(inst) or nil,prompt=(ok and inst) and firstPrompt(inst) or nil}
+    end
+    TC.stations={}
+    local tr=workspace:FindFirstChild("Training")
+    if tr then
+        for i,st in ipairs(tr:GetChildren()) do
+            if i>40 then break end
+            local pr=firstPrompt(st)
+            table.insert(TC.stations,{name=st.Name,inst=st,pos=posOf(st),prompt=pr,action=pr and (pr.ActionText~="" and pr.ActionText or pr.ObjectText) or nil})
+        end
+    end
+    TC.scannedAt=os.clock()
+    return TC
+end
+function TC.readMastery()
+    local t=os.clock(); if t-TC.masteryAt<10 then return TC.mastery end
+    TC.masteryAt=t
+    local DA=RAVYN.DataAdapters; if not (DA and DA.Mastery) then TC.mastery=nil; return nil end
+    local ok,tree,err=pcall(DA.Mastery)
+    if not ok or type(tree)~="table" then TC.mastery={error=tostring(err or tree)}; return TC.mastery end
+    local rows={}
+    for name,node in pairs(tree.children or {}) do
+        local v=node.value
+        if v==nil and node.children then local nkids=0; for _ in pairs(node.children) do nkids=nkids+1 end; v=nkids.." entries" end
+        table.insert(rows,{name=name,value=tostring(v)})
+    end
+    table.sort(rows,function(a,b) return a.name<b.name end)
+    TC.mastery={rows=rows}
+    return TC.mastery
+end
+function RAVYN:SetTrainingStyle(style)
+    if type(style)~="string" then return result(false,"INVALID_STYLE") end
+    return self:SetConfig("TrainingDirect.SelectedStyle",style)
+end
+function RAVYN:TeleportToTrainer(style)
+    style=style or self.Config.TrainingDirect.SelectedStyle
+    if not style or style=="" then return result(false,"SELECT_A_STYLE") end
+    local rec=TC.trainers[style]
+    if not rec or not rec.inst or not rec.inst.Parent then TC.scan(); rec=TC.trainers[style] end
+    if not rec or not rec.pos then TC.state="SEARCHING"; TC.detail=style.." Trainer is not streamed"; return result(false,"TRAINER_NOT_STREAMED") end
+    if not requestTravel then return result(false,"TRAVEL_UNAVAILABLE") end
+    TC.state="TRAVELING"; TC.detail="Going to "..style.." Trainer"
+    return requestTravel(rec.pos+Vector3.new(3,2,0),"TRAINER "..style,"trainer:"..style,.8)
+end
+function RAVYN:TeleportToStation(index)
+    local st=TC.stations[index]; if not st or not st.pos then return result(false,"STATION_NOT_FOUND") end
+    if not requestTravel then return result(false,"TRAVEL_UNAVAILABLE") end
+    TC.state="TRAVELING"; TC.detail="Going to station "..st.name
+    return requestTravel(st.pos+Vector3.new(3,2,0),"STATION "..st.name,"station:"..st.name,.8)
+end
+-- fires the station's own ProximityPrompt once (what pressing its key does) and verifies a visible change.
+-- The minigame itself is NOT automated: its input logic has no verified evidence.
+function RAVYN:InteractTrainingStation(index)
+    local st=TC.stations[index]; if not st or not st.prompt or not st.prompt.Parent then return result(false,"STATION_PROMPT_NOT_FOUND") end
+    local root=liveRoot(); if not root or not st.pos then return result(false,"NO_ROOT") end
+    local reach=math.max(4,(st.prompt.MaxActivationDistance or 10)-1.5)
+    if (root.Position-st.pos).Magnitude>reach+4 then return result(false,"MOVE_CLOSER_FIRST") end
+    local before=st.prompt.Enabled
+    local ok,code=firePrompt(st.prompt)
+    if not ok then return result(false,code) end
+    TC.pending={at=os.clock(),index=index,before=before}
+    TC.state="READY"; TC.detail="Station started · complete the minigame yourself"
+    return result(true,"STATION_PROMPT_SENT")
+end
+
+-- ================= loop (only does work while its feature is enabled) =================
+local token=(MZ.token or 0)+1; MZ.token=token
+task.spawn(function()
+    while not RAVYN._destroyed and MZ.token==token do
+        local t=os.clock()
+        local ok,err=pcall(muzanTick,t)
+        if not ok then MZ.detail="MUZAN_TICK_ERROR"; RAVYN.Logger:log("ERROR","MUZAN_TICK",{error=tostring(err)}) end
+        if TC.pending and t-TC.pending.at>2.5 then TC.pending=nil end
+        if TC.state=="TRAVELING" then local MO=RAVYN.MoveOwner; if not (MO and MO.current=="TRAVEL") then TC.state="READY"; TC.detail="Arrived" end end
+        task.wait(mc().Enabled and .5 or 1.5)
+    end
+end)
+local baseStop=RAVYN.Stop
+function RAVYN:Stop() MZ.pending=nil; TC.pending=nil; MZ.claimUntil=0; MZ.visitAt=nil; if MZ.state~="OFF" then MZ.state="READY" end; return baseStop(self) end
+local baseDestroy=RAVYN.Destroy
+function RAVYN:Destroy() MZ.token=MZ.token+1; MZ.found=nil; TC.trainers={}; TC.stations={}; return baseDestroy(self) end
+CTX["Muzan11"]=MZ; CTX["Training11"]=TC
+RAVYN.Logger:log("INFO","WORLD_SYSTEMS_V11_READY")
+return true]==========]); if not ok then return end end
+do local ok=runChunk("DungeonV11.lua",[==========[local G=(getgenv and getgenv()) or _G
+local CTX=G.__RAVYN_CTX
+local Util=CTX["Util"]
+local Config=CTX["Config"]
+local result=CTX["result"]
+local RAVYN=CTX["RAVYN"]
+local CardScorer=CTX["CardScorer"]
+-- RAVYN DIRECT v1.1 · Ouwigahara runtime controller structure.
+-- There is NO live evidence yet for the queue, ready, card, vote-skip or leave GUI/actions (GameKnowledge:
+-- OUWIGAHARA = RESEARCH_REQUIRED). Every such sub-action is exposed as UNAVAILABLE and refuses to run.
+-- What IS live: the card ranking engine (your preferences), and floor combat through the normal combat pipeline
+-- whenever dungeon enemies appear in the ActiveNpcs enumeration.
+Config.Default.Ouwi11={AutoQueue=false,AutoReady=false,AutoFarmFloors=false,AutoSelectCards=false,AutoVoteSkip=false,AutoLeave=false}
+RAVYN.Config.Ouwi11=Util.deepMerge(Config.Default.Ouwi11,RAVYN.Config.Ouwi11 or {})
+-- card preferences (user-provided): blacklist · priority · low priority
+Config.Default.Dungeon.LowPriority={"Attack Speed","Movement Speed"}
+Config.Default.Dungeon.LowPriorityPenalty=14
+if type(RAVYN.Config.Dungeon.LowPriority)~="table" then RAVYN.Config.Dungeon.LowPriority=Util.deepCopy(Config.Default.Dungeon.LowPriority) end
+if type(RAVYN.Config.Dungeon.LowPriorityPenalty)~="number" then RAVYN.Config.Dungeon.LowPriorityPenalty=14 end
+do -- make sure the documented priorities/blacklist are present even in older saved settings
+    local d=RAVYN.Config.Dungeon
+    for _,n in ipairs({"Iron Discipline","Grounded","Bare Hands"}) do if not Util.contains(d.Blacklist,n) then table.insert(d.Blacklist,n) end end
+    local w={["Shared Points"]=35,["Lucky Draw"]=30,["Vampiric"]=26,["Streak"]=22,["Fortune"]=18}
+    for k,v in pairs(w) do if type(d.Weights[k])~="number" then d.Weights[k]=v end end
+end
+
+local DG={state="UNAVAILABLE",detail="Ouwigahara GUI/actions are not mapped yet",runState="UNKNOWN",floor=nil,points=nil,
+    sub={
+        {key="AutoQueue",label="Auto queue",status="UNAVAILABLE",why="Queue menu action not observed"},
+        {key="AutoReady",label="Auto ready",status="UNAVAILABLE",why="Ready button not observed"},
+        {key="AutoFarmFloors",label="Auto farm floors",status="PARTIAL",why="Uses normal combat when dungeon enemies are in ActiveNpcs"},
+        {key="AutoSelectCards",label="Auto select cards",status="UNAVAILABLE",why="Card GUI not observed · ranking engine ready"},
+        {key="AutoVoteSkip",label="Auto vote skip",status="UNAVAILABLE",why="Vote GUI not observed"},
+        {key="AutoLeave",label="Auto leave",status="UNAVAILABLE",why="Leave action not observed"},
+    }}
+RAVYN.DungeonController=DG
+
+-- score one card name with the user's preferences; returns score, reason
+function DG.scoreCard(name)
+    local d=RAVYN.Config.Dungeon
+    if Util.contains(d.Blacklist,name) then return -math.huge,"BLACKLISTED" end
+    local s,why=CardScorer.score({name=name},d,{})
+    if Util.contains(d.LowPriority or {},name) then s=s-(d.LowPriorityPenalty or 14); why="LOW PRIORITY" end
+    if (d.Weights or {})[name] then why="PRIORITY" end
+    return s,why
+end
+-- rank a list of card names (used by the card step once the card GUI is mapped; previewable now)
+function DG.rank(names)
+    local out={}
+    for _,n in ipairs(names or {}) do local s,why=DG.scoreCard(n); table.insert(out,{name=n,score=s,reason=why}) end
+    table.sort(out,function(a,b) return a.score>b.score end)
+    return out
+end
+function RAVYN:RankDungeonCards(names) return result(true,"CARD_RANKING",DG.rank(names)) end
+-- toggles: only sub-actions with a live path can be enabled
+function RAVYN:SetDungeonOption(key,v)
+    if type(v)~="boolean" then return result(false,"INVALID_CONFIG") end
+    for _,s in ipairs(DG.sub) do
+        if s.key==key then
+            if v and s.status=="UNAVAILABLE" then return result(false,"ACTION_NOT_MAPPED",{feature=s.label}) end
+            return self:SetConfig("Ouwi11."..key,v)
+        end
+    end
+    return result(false,"UNKNOWN_DUNGEON_OPTION")
+end
+-- a saved ON for an unmapped action must never look live
+function DG.enforce() for _,s in ipairs(DG.sub) do if s.status=="UNAVAILABLE" then RAVYN.Config.Ouwi11[s.key]=false end end end
+DG.enforce()
+function DG.status(key)
+    for _,s in ipairs(DG.sub) do if s.key==key then
+        if s.status=="UNAVAILABLE" then return "UNAVAILABLE",s.why end
+        if not RAVYN.Config.Ouwi11[key] then return "OFF",s.why end
+        local D=RAVYN.Direct
+        return (D and D.activity and D.activity(nil)) or "READY",s.why
+    end end
+    return "UNAVAILABLE","unknown"
+end
+CTX["Dungeon11"]=DG
+RAVYN.Logger:log("INFO","DUNGEON_V11_READY")
+return true]==========]); if not ok then return end end
+do local ok=runChunk("VisualsV11.lua",[==========[local G=(getgenv and getgenv()) or _G
+local CTX=G.__RAVYN_CTX
+local Util=CTX["Util"]
+local Config=CTX["Config"]
+local result=CTX["result"]
+local RAVYN=CTX["RAVYN"]
+local LiveAction=CTX["LiveAction"]
+local liveRoot=CTX["liveRoot"]
+local D=CTX["Direct11"]
+-- RAVYN DIRECT v1.1 · Visuals (ESP)
+-- Pooled BillboardGuis (+ a few Highlights for bosses / the quest target). Objects are created once per entity and
+-- only their text/colour is updated; nothing is rebuilt per frame. NPCs come from the cached ActiveNpcs snapshot;
+-- chests/drops come from a bounded sphere query (≤ 700 parts, every 1.5 s) only while those layers are on.
+-- Other players are intentionally not tracked.
+Config.Default.Visuals={Mobs=false,Bosses=false,QuestTarget=false,Chests=false,Drops=false,ShowName=true,ShowDistance=true,ShowHealth=true,MaxDistance=1500,WorldRadius=180}
+RAVYN.Config.Visuals=Util.deepMerge(Config.Default.Visuals,RAVYN.Config.Visuals or {})
+local function vc() return RAVYN.Config.Visuals end
+-- migrate v3.7 NPC/Boss ESP flags into this layer (the old per-tick updater then stays idle).
+-- Runs now and again after saved settings load at boot.
+local function migrate()
+    local e=RAVYN.Config.Intelligence and RAVYN.Config.Intelligence.ESP
+    if e then
+        if e.NPC then RAVYN.Config.Visuals.Mobs=true; e.NPC=false end
+        if e.Boss then RAVYN.Config.Visuals.Bosses=true; e.Boss=false end
+    end
+end
+migrate()
+local baseLoad=RAVYN.LoadSettings
+function RAVYN:LoadSettings(...)
+    local r=baseLoad(self,...)
+    pcall(migrate)
+    local DG=RAVYN.DungeonController
+    if DG and DG.enforce then pcall(DG.enforce) end
+    return r
+end
+
+local Players=game:GetService("Players"); local LP=Players.LocalPlayer
+local V={items={},count=0,folder=nil,hlFolder=nil,lastNpc=0,lastWorld=0,worldHits={},state="OFF",token=0,highlights=0}
+RAVYN.Visuals=V
+local MAX_ITEMS,MAX_HIGHLIGHTS=60,24
+local COL={mob=Color3.fromRGB(240,240,245),boss=Color3.fromRGB(228,188,76),quest=Color3.fromRGB(162,128,250),chest=Color3.fromRGB(86,196,236),drop=Color3.fromRGB(74,206,132),target=Color3.fromRGB(92,151,255)}
+local CHEST_WORDS={"chest","sealed","coffer","treasure"}
+local DROP_WORDS={"pick","collect","loot","take","grab","claim","drop","soul","item","reward","orb","material"}
+local QUEST_WORDS={"crow","muzan","quest","mission","talk","speak","train"}
+local function hasAny(s,w) for _,x in ipairs(w) do if string.find(s,x,1,true) then return true end end; return false end
+local function anyOn() local c=vc(); return c.Mobs or c.Bosses or c.QuestTarget or c.Chests or c.Drops end
+
+local function ensureFolders()
+    if not (V.folder and V.folder.Parent) then
+        local pg=LP and LP:FindFirstChildOfClass("PlayerGui"); if not pg then return false end
+        local old=pg:FindFirstChild("RAVYN_ESP_V11"); if old then old:Destroy() end
+        local f=Instance.new("Folder"); f.Name="RAVYN_ESP_V11"; f.Parent=pg; V.folder=f
+    end
+    if not (V.hlFolder and V.hlFolder.Parent) then
+        local old=workspace:FindFirstChild("RAVYN_ESP_HL"); if old then old:Destroy() end
+        local f=Instance.new("Folder"); f.Name="RAVYN_ESP_HL"; f.Parent=workspace; V.hlFolder=f
+    end
+    return true
+end
+local function drop(key)
+    local it=V.items[key]; if not it then return end
+    for _,x in ipairs({it.gui,it.hl}) do if x then pcall(function() x:Destroy() end) end end
+    if it.hl then V.highlights=V.highlights-1 end
+    V.items[key]=nil; V.count=V.count-1
+end
+local function clearAll() for k in pairs(V.items) do drop(k) end; V.count=0; V.highlights=0 end
+local function upsert(key,adornee,model,text,color,wantHl)
+    local it=V.items[key]
+    if not it then
+        if V.count>=MAX_ITEMS then return end
+        local gui=Instance.new("BillboardGui"); gui.Name="RAVYN_ESP"; gui.Size=UDim2.fromOffset(200,44); gui.StudsOffset=Vector3.new(0,3.6,0)
+        gui.AlwaysOnTop=true; gui.LightInfluence=0; gui.MaxDistance=vc().MaxDistance or 1500; gui.Adornee=adornee; gui.Parent=V.folder
+        local l=Instance.new("TextLabel"); l.Size=UDim2.fromScale(1,1); l.BackgroundTransparency=1; l.TextStrokeTransparency=.35
+        l.TextSize=13; l.Font=Enum.Font.GothamSemibold; l.TextWrapped=true; l.Parent=gui
+        it={gui=gui,label=l,adornee=adornee}; V.items[key]=it; V.count=V.count+1
+    elseif it.adornee~=adornee then it.gui.Adornee=adornee; it.adornee=adornee end
+    if it.label.Text~=text then it.label.Text=text end
+    if it.color~=color then it.color=color; it.label.TextColor3=color end
+    if wantHl and model and not it.hl and V.highlights<MAX_HIGHLIGHTS then
+        local h=Instance.new("Highlight"); h.Adornee=model; h.FillTransparency=.78; h.OutlineTransparency=.1; h.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop
+        h.FillColor=color; h.OutlineColor=color; h.Parent=V.hlFolder; it.hl=h; V.highlights=V.highlights+1
+    elseif it.hl and not wantHl then pcall(function() it.hl:Destroy() end); it.hl=nil; V.highlights=V.highlights-1
+    elseif it.hl and it.hl.FillColor~=color then it.hl.FillColor=color; it.hl.OutlineColor=color end
+end
+local function label(name,dist,pct,tag)
+    local c=vc(); local parts={}
+    if c.ShowName then table.insert(parts,(tag and (tag.."  ") or "")..tostring(name)) end
+    local sub={}
+    if c.ShowHealth and pct then table.insert(sub,string.format("%d%%",math.floor(pct+.5))) end
+    if c.ShowDistance and dist then table.insert(sub,string.format("%.0f studs",dist)) end
+    if #sub>0 then table.insert(parts,table.concat(sub,"  ·  ")) end
+    return table.concat(parts,"\n")
+end
+local function questName()
+    local ob=D.objective; if ob and ob.name then return ob.name end
+    local QB=RAVYN.QuestBrain; return QB and QB.targetName or nil
+end
+
+local function npcPass(seen)
+    local c=vc(); local RA=RAVYN.ReadAdapter
+    local qn=c.QuestTarget and questName() or nil
+    local maxD=c.MaxDistance or 1500
+    for _,e in ipairs((RAVYN.Features.snapshot or {}).npcs or {}) do
+        local isBoss=e.isBoss==true or e.classification=="BOSS"
+        local isQuest=qn~=nil and e.name==qn
+        if e.alive~=false and (e.distance or 0)<=maxD and ((isQuest) or (isBoss and c.Bosses) or ((not isBoss) and c.Mobs)) then
+            local raw=RA and RA.lastEntities and RA.lastEntities[e.id]
+            local root=raw and RA:_entityRoot(raw)
+            if root then
+                local key="npc:"..e.id; seen[key]=true
+                local pct=(e.health and e.maxHealth and e.maxHealth>0) and e.health/e.maxHealth*100 or nil
+                local selected=LiveAction.targetId==e.id
+                local color=(isQuest and COL.quest) or (selected and COL.target) or (isBoss and COL.boss) or COL.mob
+                local tag=(isQuest and "◇ QUEST") or (isBoss and "◆ BOSS") or nil
+                upsert(key,root,raw,label(e.name,e.distance,pct,tag),color,isBoss or isQuest)
+            end
+        end
+    end
+end
+local function worldPass(seen,t)
+    local c=vc()
+    if not (c.Chests or c.Drops) then V.worldHits={}; return end
+    local root=liveRoot(); if not root then return end
+    if t-V.lastWorld>=1.5 then
+        V.lastWorld=t; V.worldHits={}
+        local params=OverlapParams.new(); if root.Parent then params.FilterType=Enum.RaycastFilterType.Exclude; params.FilterDescendantsInstances={root.Parent} end
+        local ok,parts=pcall(function() return workspace:GetPartBoundsInRadius(root.Position,math.min(c.WorldRadius or 180,250),params) end)
+        if ok then
+            local done={}
+            for i,p in ipairs(parts) do
+                if i>700 then break end
+                local m=p:FindFirstAncestorWhichIsA("Model"); local holder=(m and m~=workspace) and m or p
+                if not done[holder] then
+                    done[holder]=true
+                    if not (holder:IsA("Model") and holder:FindFirstChildOfClass("Humanoid")) then
+                        local okP,pr=pcall(function() return holder:FindFirstChildWhichIsA("ProximityPrompt",true) end)
+                        if okP and pr and pr.Enabled then
+                            local s=string.lower(pr.ActionText.." "..pr.ObjectText.." "..holder.Name)
+                            if not hasAny(s,QUEST_WORDS) then
+                                local kind=(hasAny(s,CHEST_WORDS) and "chest") or (hasAny(s,DROP_WORDS) and "drop") or nil
+                                if kind then table.insert(V.worldHits,{holder=holder,part=p,kind=kind,name=(pr.ObjectText~="" and pr.ObjectText) or holder.Name}) end
+                            end
+                        end
+                    end
+                end
+                if #V.worldHits>=30 then break end
+            end
+        end
+    end
+    for _,h in ipairs(V.worldHits) do
+        if h.holder.Parent and ((h.kind=="chest" and c.Chests) or (h.kind=="drop" and c.Drops)) then
+            local key=h.holder; seen[key]=true
+            local d=h.part.Parent and (root.Position-h.part.Position).Magnitude or nil
+            upsert(key,h.part,nil,label(h.name,d,nil,h.kind=="chest" and "▣ CHEST" or "• DROP"),h.kind=="chest" and COL.chest or COL.drop,false)
+        end
+    end
+end
+local function step(t)
+    if not anyOn() then if V.count>0 then clearAll() end; V.state="OFF"; return end
+    if not ensureFolders() then return end
+    -- the automation loop refreshes the snapshot while running; when stopped, refresh it lightly for ESP
+    if not D.running() and t-(D.snapshotAt or -math.huge)>.6 then pcall(function() RAVYN:RefreshReadBindings() end) end
+    local seen={}
+    npcPass(seen); worldPass(seen,t)
+    for k in pairs(V.items) do if not seen[k] then drop(k) end end
+    V.state="READY"
+end
+function RAVYN:SetVisual(key,v)
+    if type(v)~="boolean" or vc()[key]==nil then return result(false,"INVALID_VISUAL_OPTION") end
+    local r=self:SetConfig("Visuals."..key,v)
+    if r.ok and not anyOn() then clearAll() end
+    return r
+end
+-- legacy API (Settings / Auto Play "AutoESP") now drives this layer
+function RAVYN:SetESP(kind,v)
+    if kind=="NPC" then return self:SetVisual("Mobs",v==true) elseif kind=="Boss" then return self:SetVisual("Bosses",v==true) end
+    return result(false,"UNKNOWN_ESP_KIND")
+end
+V.token=V.token+1
+local token=V.token
+task.spawn(function()
+    while not RAVYN._destroyed and V.token==token do
+        local t=os.clock()
+        local ok,err=pcall(step,t)
+        if not ok then RAVYN.Logger:log("WARN","ESP_STEP",{error=tostring(err)}) end
+        task.wait(anyOn() and .3 or 1)
+    end
+    clearAll()
+end)
+local baseDestroy=RAVYN.Destroy
+function RAVYN:Destroy()
+    V.token=V.token+1; clearAll()
+    for _,f in ipairs({V.folder,V.hlFolder}) do if f then pcall(function() f:Destroy() end) end end
+    V.folder=nil; V.hlFolder=nil
+    return baseDestroy(self)
+end
+CTX["Visuals11"]=V
+RAVYN.Logger:log("INFO","VISUALS_V11_READY")
+return true]==========]); if not ok then return end end
+do local ok=runChunk("BossLootV2.lua",[==========[local G=(getgenv and getgenv()) or _G
+local CTX=G.__RAVYN_CTX
+local Util=CTX["Util"]
+local Config=CTX["Config"]
+local result=CTX["result"]
+local RAVYN=CTX["RAVYN"]
+local liveRoot=CTX["liveRoot"]
+local requestTravel=CTX["requestTravel384"]
+local pressKey=CTX["pressKey"]
+local keyCodeFromText=CTX["keyCodeFromText"]
+local P=CTX["JobPriority"]
+local D=CTX["Direct11"]
+-- RAVYN DIRECT v1.2 · BossLootController V2
+-- Live evidence (UniversalTrace #001, Datai):
+--   +113.2s NPC_DIED Datai [HealthZero]
+--   +113.3s GUI ChestPrompt appears · KeyHolder...NoneHolding.TextLabel = "T"
+--   +127.3s KEY T → +127.5s DATA.Progress.chests 197→198 → ChestPrompt removed → Workspace LootDrop (Common/Rare/Epic) appear
+--   LootDropPrompt (key T, item name + "Claim") → KEY T → prompt removed → DATA.Inventory.<item>.Amount increases
+-- Flow: death → wait ChestPrompt → press its key once → verify (chests counter or prompt gone) → wait drops →
+-- collect every drop with its prompt key → verify (inventory / drop removed / prompt gone) → quiet rescan → finish.
+-- Only the key the prompt itself displays is pressed. No remotes. fireproximityprompt is a fallback for a prompt
+-- that stays unverified, on the ProximityPrompt that sits under the prompt's own Adornee.
+local defaults={Enabled=true,ChestWait=6,ChestVerify=2.5,DropWait=4,DropVerify=1.6,MaxAttempts=3,QuietWindow=1.2,SessionTimeout=45,
+    KeyFallback="T",UsePromptFallback=true,WatchChestPrompt=true}
+Config.Default.BossLootV2=Util.deepCopy(defaults)
+RAVYN.Config.BossLootV2=Util.deepMerge(defaults,RAVYN.Config.BossLootV2 or {})
+local function bc() return RAVYN.Config.BossLootV2 end
+local LC=RAVYN.LootController
+local LP=game:GetService("Players").LocalPlayer
+
+local B={token=0,holder=nil,holderAt=-math.huge,stats={sessions=0,chestsOpened=0,chestUnverified=0,items=0,unverified=0},lastItems={},lastKey=nil,phase="IDLE",verifiedBy=nil}
+RAVYN.BossLootV2=B
+local S=nil
+local function exec(name) local f=(getgenv and getgenv()[name]) or G[name]; return type(f)=="function" and f or nil end
+local function event(text,kind)
+    if LC then table.insert(LC.events,{at=os.clock(),text=text,kind=kind or "info"}); while #LC.events>30 do table.remove(LC.events,1) end end
+    RAVYN.Logger:log("INFO","LOOT · "..text,{})
+end
+local function posOf(inst)
+    if not inst or not inst.Parent then return nil end
+    if inst:IsA("BasePart") then return inst.Position end
+    if inst:IsA("Attachment") then return inst.WorldPosition end
+    if inst:IsA("Model") then local ok,cf=pcall(function() return inst:GetPivot() end); if ok then return cf.Position end end
+    local a=inst:FindFirstChild("Attachment2"); if a and a:IsA("Attachment") then return a.WorldPosition end
+    local bp=inst:FindFirstChildWhichIsA("BasePart",true); return bp and bp.Position or nil
+end
+
+-- ---------------- prompt GUIs (PlayerGui.PromptsHolder.ChestPrompt / LootDropPrompt) ----------------
+local function playerGui() return LP and LP:FindFirstChildOfClass("PlayerGui") end
+local function promptsHolder(deep)
+    if B.holder and B.holder.Parent then return B.holder end
+    local pg=playerGui(); if not pg then return nil end
+    local h=pg:FindFirstChild("PromptsHolder")
+    if not h and deep and os.clock()-B.holderAt>3 then
+        -- one bounded lookup (only inside a loot session) to learn where the prompt GUIs are parented
+        B.holderAt=os.clock()
+        local ok,c=pcall(function() return pg:FindFirstChild("ChestPrompt",true) or pg:FindFirstChild("LootDropPrompt",true) end)
+        if ok and c then h=c.Parent end
+    end
+    if h then B.holder=h end
+    return h or pg
+end
+local function shown(g)
+    if not g or not g.Parent then return false end
+    if g:IsA("LayerCollector") then if not g.Enabled then return false end
+    elseif g:IsA("GuiObject") and not g.Visible then return false end
+    local tb=g:FindFirstChild("TextButton")
+    if tb and tb:IsA("GuiObject") and not tb.Visible then return false end
+    return true
+end
+local function keyOf(g)
+    local kh=g:FindFirstChild("KeyHolder",true)
+    local lab=kh and kh:FindFirstChildWhichIsA("TextLabel",true)
+    local t=lab and D.trim(lab.Text) or ""
+    if t~="" and #t<=3 and keyCodeFromText(t) then return string.upper(t),"PROMPT_LABEL" end
+    return bc().KeyFallback or "T","FALLBACK"
+end
+local function itemOf(g)
+    local th=g:FindFirstChild("TextHolder",true)
+    local lab=th and th:FindFirstChild("TextLabel")
+    return lab and D.trim(lab.Text) or nil
+end
+local function adorneeOf(g)
+    if g:IsA("BillboardGui") then local ok,a=pcall(function() return g.Adornee end); if ok and a then return a end end
+    return nil
+end
+-- visible prompts of one kind, nearest first
+local function prompts(name,deep)
+    local h=promptsHolder(deep); local out={}
+    if not h then return out end
+    local root=liveRoot()
+    for _,g in ipairs(h:GetChildren()) do
+        if g.Name==name and shown(g) then
+            local a=adorneeOf(g); local p=a and posOf(a)
+            local k,src=keyOf(g)
+            table.insert(out,{gui=g,adornee=a,pos=p,key=k,keySource=src,item=itemOf(g),dist=(p and root) and (root.Position-p).Magnitude or 0})
+        end
+    end
+    table.sort(out,function(a,b) return a.dist<b.dist end)
+    return out
+end
+-- another (non-loot) prompt showing the same key could steal the press (the trace shows a "Wall · Climb" prompt on T)
+local function competingPrompt(key)
+    local h=promptsHolder(false); if not h then return nil end
+    for _,g in ipairs(h:GetChildren()) do
+        if g.Name~="ChestPrompt" and g.Name~="LootDropPrompt" and shown(g) and g:FindFirstChild("KeyHolder",true) then
+            local k=keyOf(g); if k==key then return itemOf(g) or g.Name end
+        end
+    end
+    return nil
+end
+
+-- ---------------- local data (Player_Service.Data.<LocalPlayer>, active slot) ----------------
+local function dataRoots()
+    local SCH=RAVYN.RuntimeSchema; if not (SCH and SCH.get) then return {} end
+    local s=SCH.get(); local n=s.nodes or {}
+    return {n.sectionRoot,n.playerData}
+end
+local function chestsCounter()
+    for _,r in ipairs(dataRoots()) do
+        if r and r.Parent then
+            local pr=r:FindFirstChild("Progress"); local v=pr and pr:FindFirstChild("chests")
+            if v and v:IsA("ValueBase") then return tonumber(v.Value) end
+        end
+    end
+    return nil
+end
+local function inventory()
+    for _,r in ipairs(dataRoots()) do
+        if r and r.Parent then
+            local inv=r:FindFirstChild("Inventory")
+            if inv then
+                local out={}
+                for i,it in ipairs(inv:GetChildren()) do
+                    if i>800 then break end
+                    local a=it:FindFirstChild("Amount")
+                    if a and a:IsA("ValueBase") then out[it.Name]=tonumber(a.Value) or 0 end
+                end
+                return out
+            end
+        end
+    end
+    return nil
+end
+local function gained(before,after)
+    local out={}
+    if not (before and after) then return out end
+    for k,v in pairs(after) do if v>(before[k] or 0) then table.insert(out,{name=k,delta=v-(before[k] or 0)}) end end
+    return out
+end
+-- Workspace LootDrop objects (trace: WS.LootDrop.<Common|Rare|Epic>.Attachment2.start.Beam)
+local function worldDrops()
+    local out={}
+    for _,c in ipairs(workspace:GetChildren()) do
+        if c.Name=="LootDrop" then
+            local nested=false
+            for _,k in ipairs(c:GetChildren()) do if k:FindFirstChild("Attachment2") then nested=true; table.insert(out,k) end end
+            if not nested and c:FindFirstChild("Attachment2") then table.insert(out,c) end
+        end
+    end
+    return out
+end
+local function underPrompt(inst)
+    if not inst then return nil end
+    local ok,pp=pcall(function() return inst:FindFirstChildWhichIsA("ProximityPrompt",true) end)
+    return ok and pp or nil
+end
+
+-- ---------------- session ----------------
+local function publish()
+    if not S then return end
+    local det,col,unv=0,0,0
+    for _,it in pairs(S.items) do det=det+1; if it.collected then col=col+1 end; if it.unverified then unv=unv+1 end end
+    LC.detected=det; LC.collected=col; LC.unverified=unv; LC.attempted=det; LC.remaining=math.max(0,det-col-unv)
+    LC.bossName=S.bossName; LC.expectedChest=S.chestName or "Boss chest"; LC.chestState=S.chestState; LC.chestInteraction="KEY "..tostring(B.lastKey or "?")
+end
+local function setPhase(ph,label)
+    if S.phase~=ph then S.phase=ph; S.phaseAt=os.clock() end
+    B.phase=ph; LC.state=label or ph
+end
+local function finish(code,kind)
+    if not S then return end
+    publish()
+    local names={}; for _,g in ipairs(S.gainedAll) do table.insert(names,g.name..(g.delta>1 and (" ×"..g.delta) or "")) end
+    local summary=string.format("%s%s · chest %s · %d/%d drops%s",S.bossName and (S.bossName.." · ") or "",code,S.chestState,LC.collected,LC.detected,
+        #names>0 and (" · "..table.concat(names,", ")) or "")
+    B.lastItems=names; LC.lastResult=summary; event(summary,kind or "success")
+    S=nil; LC.active=false; LC.v2Active=false; LC.priority=0; LC.state="COMPLETE"; B.phase="IDLE"
+    local sid=B.token
+    task.delay(1.5,function() if B.token==sid and not LC.active then LC.state="IDLE" end end)
+end
+local function begin(kind,origin,ctx)
+    B.token=B.token+1; B.stats.sessions=B.stats.sessions+1
+    local now=os.clock()
+    S={id=B.token,kind=kind,origin=D.toV3(origin),bossName=ctx and ctx.bossName,chestName=ctx and ctx.chest,startedAt=now,phase="",phaseAt=now,
+        chestAttempts=0,chestFiredAt=-math.huge,chestState="WAITING",items={},gainedAll={},lastNewAt=now}
+    LC.active=true; LC.v2Active=true; LC.kind="BOSS_V2"; LC.priority=(P and P.BOSS_LOOT) or 110; LC.failReason=nil; LC.probe=nil
+    if D then D.bump("loot") end
+    setPhase("WAIT_CHEST","WAITING_CHEST"); publish()
+    event("Boss loot · "..tostring(S.bossName or kind).." · waiting for chest","info")
+end
+B.begin=begin
+
+local function press(key,why)
+    B.lastKey=key
+    -- loot prompt key (not combat): declared LOOT scope for the v1.2.2 InputAudit
+    local IA=RAVYN.InputAudit
+    local ok,src
+    if IA and IA.withScope then ok,src=IA.withScope("LOOT",pressKey,key) else ok,src=pressKey(key) end
+    if not ok then LC.failReason="INPUT_UNAVAILABLE" end
+    return ok,src
+end
+local function chestStep(now,root)
+    local list=prompts("ChestPrompt",true); local cp=list[1]
+    if S.phase=="WAIT_CHEST" then
+        if cp then setPhase("OPEN_CHEST","OPENING"); return end
+        if #worldDrops()>0 and now-S.phaseAt>1 then S.chestState="NOT_SHOWN"; setPhase("WAIT_DROPS","DETECTING_DROPS"); return end
+        if now-S.phaseAt>(bc().ChestWait or 6) then S.chestState="NOT_SHOWN"; setPhase("WAIT_DROPS","DETECTING_DROPS"); return end
+        -- the prompt only shows inside its range: after 1.5 s move to where the boss died
+        if now-S.phaseAt>1.5 and S.origin and (root.Position-S.origin).Magnitude>6 and requestTravel then
+            requestTravel(S.origin+Vector3.new(0,3,0),"BOSS CHEST","v2chest:"..S.id,.5)
+        end
+        return
+    end
+    -- OPEN_CHEST
+    if S.chestAttempts>0 then
+        local c=chestsCounter()
+        local byCounter=(S.chestsBefore~=nil and c~=nil and c>S.chestsBefore)
+        if byCounter or not cp then
+            S.chestState="OPEN_VERIFIED"; B.verifiedBy=byCounter and "CHESTS_COUNTER" or "PROMPT_GONE"
+            B.stats.chestsOpened=B.stats.chestsOpened+1
+            event("Chest opened · verified by "..(byCounter and ("chests "..tostring(S.chestsBefore).."→"..tostring(c)) or "prompt disappearing"),"success")
+            setPhase("WAIT_DROPS","DETECTING_DROPS"); return
+        end
+    elseif not cp then
+        if now-S.phaseAt>2 then setPhase("WAIT_CHEST","WAITING_CHEST") end
+        return
+    end
+    if cp.pos and cp.dist>9 and requestTravel then requestTravel(cp.pos+Vector3.new(0,2.5,0),"BOSS CHEST","v2chest:"..S.id,.5); return end
+    local due=S.chestAttempts==0 or now-S.chestFiredAt>(bc().ChestVerify or 2.5)
+    if not due then return end
+    if S.chestAttempts>=(bc().MaxAttempts or 3) then
+        -- last resort on the chest's own ProximityPrompt, then give up honestly
+        local pp=bc().UsePromptFallback and underPrompt(cp.adornee)
+        local f=exec("fireproximityprompt")
+        if pp and f and not S.chestFallback then
+            S.chestFallback=true; S.chestFiredAt=now; pcall(function() f(pp,math.max(pp.HoldDuration or 0,0)) end); return
+        end
+        S.chestState="OPEN_UNVERIFIED"; B.stats.chestUnverified=B.stats.chestUnverified+1; LC.failReason="CHEST_OPEN_UNVERIFIED"
+        event("Chest key sent "..S.chestAttempts.."× but no counter/prompt change","warn")
+        setPhase("WAIT_DROPS","DETECTING_DROPS"); return
+    end
+    local rival=competingPrompt(cp.key)
+    if rival and S.chestAttempts==0 and cp.pos and requestTravel then
+        -- step onto the chest so its prompt is the closest one for this key
+        requestTravel(cp.pos+Vector3.new(0,2,0),"BOSS CHEST","v2chest-exact:"..S.id,.4)
+    end
+    S.chestsBefore=chestsCounter()
+    press(cp.key,"CHEST")
+    S.chestAttempts=S.chestAttempts+1; S.chestFiredAt=now; S.chestState="OPEN_SENT"
+end
+local function collectStep(now,root)
+    -- register targets: world LootDrop objects + adornees of visible LootDropPrompts
+    for _,inst in ipairs(worldDrops()) do
+        if not S.items[inst] then S.items[inst]={inst=inst,attempts=0}; S.lastNewAt=now end
+    end
+    local lp=prompts("LootDropPrompt",true)
+    for _,p in ipairs(lp) do
+        if p.adornee and not S.items[p.adornee] then
+            local known=false
+            for inst in pairs(S.items) do if inst==p.adornee or (typeof(inst)=="Instance" and p.adornee:IsDescendantOf(inst)) then known=true; break end end
+            if not known then S.items[p.adornee]={inst=p.adornee,attempts=0}; S.lastNewAt=now end
+        end
+    end
+    -- resolve pending verification / gone drops
+    local pending=nil; local nearest,nd=nil,math.huge
+    for inst,it in pairs(S.items) do
+        if not it.collected and not it.unverified and not it.gone then
+            if it.pending then
+                local after=inventory(); local g=gained(it.pending.inv,after)
+                local removed=not inst.Parent
+                local promptGone=it.pending.item and (function() for _,p in ipairs(prompts("LootDropPrompt",false)) do if p.item==it.pending.item then return false end end; return true end)() or false
+                if #g>0 or removed or promptGone then
+                    it.collected=true; it.pending=nil; B.stats.items=B.stats.items+1
+                    for _,x in ipairs(g) do table.insert(S.gainedAll,x) end
+                    it.evidence=(#g>0 and "INVENTORY") or (removed and "DROP_REMOVED") or "PROMPT_GONE"
+                elseif now-it.firedAt>(bc().DropVerify or 1.6) then
+                    it.pending=nil
+                    if it.attempts>=(bc().MaxAttempts or 3) then it.unverified=true; B.stats.unverified=B.stats.unverified+1 end
+                else pending=it end
+            elseif not inst.Parent then
+                it.gone=true -- despawned before we reached it (not counted as collected)
+            else
+                local p=posOf(inst); it.pos=p or it.pos
+                local d=(p and (root.Position-p).Magnitude) or math.huge
+                if d<nd then nearest,nd=it,d end
+            end
+        end
+    end
+    publish()
+    if pending then LC.state=string.format("VERIFYING %d / %d",LC.collected,LC.detected); return true end
+    if not nearest then return false end
+    LC.state=string.format("COLLECTING %d / %d",LC.collected,LC.detected)
+    if nd>5 and nearest.pos and requestTravel then
+        nearest.arrivedAt=nil
+        requestTravel(nearest.pos+Vector3.new(0,2,0),"LOOT","v2drop:"..S.id..":"..tostring(nearest.inst),.5)
+        return true
+    end
+    nearest.arrivedAt=nearest.arrivedAt or now
+    local shownNow=prompts("LootDropPrompt",false)[1]
+    if shownNow and now-nearest.arrivedAt>=.15 then
+        local rival=competingPrompt(shownNow.key)
+        if rival and nearest.attempts==0 and nearest.pos and requestTravel then
+            requestTravel(nearest.pos+Vector3.new(0,1,0),"LOOT","v2drop-exact:"..S.id..":"..tostring(nearest.inst),.4)
+        end
+        nearest.pending={inv=inventory(),item=shownNow.item}
+        press(shownNow.key,"DROP")
+        nearest.attempts=nearest.attempts+1; nearest.firedAt=now
+        return true
+    end
+    if not shownNow and now-nearest.arrivedAt>1.5 then
+        -- standing on the drop but no prompt shows: its own ProximityPrompt is the only other real affordance
+        local pp=bc().UsePromptFallback and underPrompt(nearest.inst); local f=exec("fireproximityprompt")
+        nearest.attempts=nearest.attempts+1; nearest.arrivedAt=now
+        if pp and f then
+            nearest.pending={inv=inventory(),item=nil}; nearest.firedAt=now
+            pcall(function() f(pp,math.max(pp.HoldDuration or 0,0)) end)
+        elseif nearest.attempts>=(bc().MaxAttempts or 3) then
+            nearest.unverified=true; B.stats.unverified=B.stats.unverified+1; LC.failReason="NO_PROMPT_SHOWN"
+        end
+    end
+    return true
+end
+local function tick()
+    local now=os.clock()
+    if not S then
+        -- watcher: a ChestPrompt showing with no session (mini bosses, world chests) starts one — cheap direct-child check
+        if bc().Enabled and bc().WatchChestPrompt and D.running() and not LC.active and RAVYN.Config.Loot384.AutoLootChests then
+            local h=promptsHolder(false); local cp=h and h:FindFirstChild("ChestPrompt")
+            if cp and shown(cp) then local root=liveRoot(); begin("CHEST_PROMPT",root and root.Position,nil) end
+        end
+        return
+    end
+    if not D.running() then S=nil; LC.v2Active=false; LC.active=false; LC.state="IDLE"; return end
+    local root=liveRoot(); if not root then return end
+    if now-S.startedAt>(bc().SessionTimeout or 45) then finish("LOOT_TIMEOUT","warn"); return end
+    if S.phase=="WAIT_CHEST" or S.phase=="OPEN_CHEST" then chestStep(now,root); publish(); return end
+    local busy=collectStep(now,root)
+    if S.phase=="WAIT_DROPS" then
+        if busy then setPhase("COLLECT",LC.state)
+        elseif now-S.phaseAt>(bc().DropWait or 4) then setPhase("QUIET","RESCAN") end
+        return
+    end
+    if S.phase=="COLLECT" and not busy then setPhase("QUIET","RESCAN"); return end
+    if S.phase=="QUIET" then
+        if busy then setPhase("COLLECT",LC.state); return end
+        if now-S.phaseAt>=(bc().QuietWindow or 1.2) and now-S.lastNewAt>=(bc().QuietWindow or 1.2) then
+            local warn=S.chestState=="OPEN_UNVERIFIED" or LC.unverified>0
+            finish(LC.detected==0 and "NO_DROPS" or "LOOT COMPLETE",warn and "warn" or "success")
+        end
+    end
+end
+
+-- boss kills route to V2 (normal mob kills keep the v3.8.4.2 path)
+local baseStart=RAVYN.StartKillLoot
+function RAVYN:StartKillLoot(pos,isBoss,baseline,quest,ctx)
+    if isBoss and bc().Enabled and self.Config.Loot384.AutoLootAfterKill then
+        if S then return result(false,"LOOT_BUSY") end
+        if LC.active and not LC.v2Active then return baseStart(self,pos,isBoss,baseline,quest,ctx) end
+        begin("BOSS",pos,ctx)
+        return result(true,"LOOT_SESSION_STARTED",{kind="BOSS_V2"})
+    end
+    return baseStart(self,pos,isBoss,baseline,quest,ctx)
+end
+function RAVYN:GetBossLootV2Status()
+    return result(true,"BOSS_LOOT_V2",{phase=B.phase,chest=S and S.chestState,stats=B.stats,lastItems=B.lastItems,key=B.lastKey,verifiedBy=B.verifiedBy,chests=chestsCounter()})
+end
+B.chestsCounter=chestsCounter
+
+-- capability provider: promote exactly what the trace established
+local GK=RAVYN.GameKnowledge
+if GK and GK.capabilities then
+    local ev="Trace #001: Datai HealthZero → ChestPrompt (key T) → T → Progress.chests 198 → LootDrop; LootDropPrompt T → Inventory Amount"
+    if GK.capabilities.BOSS_CHEST_OPEN then GK.capabilities.BOSS_CHEST_OPEN.status="PARTIAL"; GK.capabilities.BOSS_CHEST_OPEN.evidence=ev end
+    if GK.capabilities.DROP_COLLECTION then GK.capabilities.DROP_COLLECTION.status="PARTIAL"; GK.capabilities.DROP_COLLECTION.evidence=ev end
+end
+
+B.loop=(B.loop or 0)+1
+local mine=B.loop
+task.spawn(function()
+    while not RAVYN._destroyed and B.loop==mine do
+        local ok,err=pcall(tick)
+        if not ok then RAVYN.Logger:log("ERROR","BOSS_LOOT_V2_TICK",{error=tostring(err)}); if S then pcall(finish,"LOOT_ERROR","warn") end end
+        task.wait(S and .15 or .3)
+    end
+end)
+local baseStop=RAVYN.Stop
+function RAVYN:Stop() S=nil; B.token=B.token+1; LC.v2Active=false; B.phase="IDLE"; return baseStop(self) end
+local baseDestroy=RAVYN.Destroy
+function RAVYN:Destroy() B.loop=B.loop+1; S=nil; LC.v2Active=false; B.holder=nil; return baseDestroy(self) end
+CTX["BossLootV2"]=B
+RAVYN.Logger:log("INFO","BOSS_LOOT_V2_READY")
+return true]==========]); if not ok then return end end
+do local ok=runChunk("OuwiReaderV12.lua",[==========[local G=(getgenv and getgenv()) or _G
+local CTX=G.__RAVYN_CTX
+local Util=CTX["Util"]
+local Config=CTX["Config"]
+local result=CTX["result"]
+local RAVYN=CTX["RAVYN"]
+local DG=CTX["Dungeon11"]
+-- RAVYN DIRECT v1.2 · OuwigaharaStateReader (dynamic, no trace yet).
+-- Only while Dungeon mode is ON: search PlayerGui ONCE (bounded, ≤ every 5 s until found) for semantic text —
+-- Floor · Points · Enemies remaining · Rerolls · card title/description/button groups — cache the ScreenGui that
+-- holds them, then read ONLY that cached root (1 Hz). No card list is hard-coded: cards are recognised by
+-- structure (≥2 sibling panels, each with a button and ≥2 texts); preference names are only a hint.
+-- Card clicking stays locked until a card set was actually discovered at runtime, and then it is verified.
+Config.Default.Ouwi11.Enabled=false
+if type(RAVYN.Config.Ouwi11.Enabled)~="boolean" then RAVYN.Config.Ouwi11.Enabled=false end
+local LP=game:GetService("Players").LocalPlayer
+local R={status="OFF",detail="",root=nil,rootPath=nil,cardRoot=nil,discoverAt=-math.huge,cardAt=-math.huge,readAt=-math.huge,
+    floor=nil,points=nil,enemies=nil,rerolls=nil,cards={},ranked={},hits={},cardsSeen=false,clicks=0,clickVerified=0,clickFails=0,pendingClick=nil}
+DG.reader=R
+local VIM=game:GetService("VirtualInputManager")
+local function low(v) return string.lower(tostring(v or "")) end
+local function trim(v) v=tostring(v or ""); v=string.gsub(v,"<.->",""); v=string.gsub(v,"^%s+",""); v=string.gsub(v,"%s+$",""); return v end
+local function num(s) if not s then return nil end; s=string.gsub(s,",",""); return tonumber(s) end
+local function visibleChain(g,stop)
+    local cur=g
+    for _=1,25 do
+        if not cur or cur==stop then return true end
+        if cur:IsA("GuiObject") and not cur.Visible then return false end
+        if cur:IsA("LayerCollector") and not cur.Enabled then return false end
+        cur=cur.Parent
+    end
+    return true
+end
+-- semantic patterns → kind, value
+local function classify(text)
+    local t=low(trim(text))
+    if t=="" or #t>80 then return nil end
+    local v=string.match(t,"floor%s*[:#]?%s*(%d+)"); if v then return "floor",num(v) end
+    if string.match(t,"^floor") then return "floor",nil end
+    v=string.match(t,"enem[%a]*%s*remaining%s*[:]?%s*(%d+)") or string.match(t,"(%d+)%s*enem[%a]*%s*remaining") or string.match(t,"enem[%a]*%s*left%s*[:]?%s*(%d+)") or string.match(t,"(%d+)%s*enem[%a]*%s*left")
+    if v then return "enemies",num(v) end
+    if string.find(t,"enemies remaining",1,true) then return "enemies",nil end
+    v=string.match(t,"rerolls?%s*[:]?%s*(%d+)") or string.match(t,"(%d+)%s*rerolls?"); if v then return "rerolls",num(v) end
+    if string.find(t,"reroll",1,true) then return "rerolls",nil end
+    v=string.match(t,"points?%s*[:]?%s*([%d,]+)") or string.match(t,"([%d,]+)%s*points?"); if v then return "points",num(v) end
+    if string.find(t,"points",1,true) then return "points",nil end
+    return nil
+end
+local function layerOf(g) local cur=g; while cur and not cur:IsA("LayerCollector") do cur=cur.Parent end; return cur end
+local function prefNames()
+    local d=RAVYN.Config.Dungeon; local set={}
+    for _,l in ipairs({d.Blacklist or {},d.PriorityOrder or {},d.LowPriority or {}}) do for _,n in ipairs(l) do set[low(n)]=true end end
+    for n in pairs(d.Weights or {}) do set[low(n)]=true end
+    return set
+end
+-- one bounded PlayerGui pass: pick the ScreenGui with the most distinct dungeon HUD kinds
+local function discover(now)
+    if now-R.discoverAt<5 then return end
+    R.discoverAt=now
+    local pg=LP and LP:FindFirstChildOfClass("PlayerGui"); if not pg then return end
+    local own=RAVYN._gui
+    local ok,desc=pcall(function() return pg:GetDescendants() end); if not ok then return end
+    local score={}; local hints={}
+    for i,d in ipairs(desc) do
+        if i>8000 then break end
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and not (own and d:IsDescendantOf(own)) then
+            local kind=classify(d.Text)
+            local lg=layerOf(d)
+            if kind and lg then score[lg]=score[lg] or {}; score[lg][kind]=true end
+            local t=low(d.Text)
+            if lg and (string.find(t,"card",1,true) or string.find(t,"choose",1,true) or string.find(t,"select",1,true) or string.find(t,"reroll",1,true)) then hints[lg]=true end
+        end
+    end
+    local best,bn=nil,0
+    for lg,kinds in pairs(score) do
+        local n=0; for _ in pairs(kinds) do n=n+1 end
+        -- a lone "points" label (skill points, etc.) is not a dungeon HUD: need 2 kinds, or Floor / Enemies remaining
+        local strong=n>=2 or kinds.floor or kinds.enemies
+        if strong and n>bn then best,bn=lg,n end
+    end
+    R.root=best; R.rootPath=best and best:GetFullName() or nil; R.kindsFound=bn
+    R.cardHints=hints
+end
+-- card set = container with ≥2 visible children, each holding a GuiButton and ≥2 non-empty texts
+local function cardPanel(c,stop)
+    local texts={}; local btn=c:IsA("GuiButton") and c or nil
+    local ok,desc=pcall(function() return c:GetDescendants() end); if not ok then return nil end
+    for i,d in ipairs(desc) do
+        if i>60 then break end
+        if not btn and d:IsA("GuiButton") then btn=d end
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and visibleChain(d,stop) then
+            local t=trim(d.Text); if t~="" then table.insert(texts,{t=t,name=low(d.Name),size=d.TextSize or 0}) end
+        end
+    end
+    if not btn or #texts<2 then return nil end
+    local title=nil
+    for _,x in ipairs(texts) do if string.find(x.name,"title",1,true) or x.name=="name" or string.find(x.name,"cardname",1,true) then title=x.t; break end end
+    if not title then
+        table.sort(texts,function(a,b) return a.size>b.size end)
+        for _,x in ipairs(texts) do if #x.t<=32 and not tonumber(x.t) then title=x.t; break end end
+    end
+    local desc2=""; for _,x in ipairs(texts) do if #x.t>#desc2 and x.t~=title then desc2=x.t end end
+    return title and {title=title,desc=desc2,button=btn,panel=c} or nil
+end
+local function discoverCards(now)
+    if now-R.cardAt<3 then return end
+    R.cardAt=now
+    local roots={}
+    if R.root and R.root.Parent then roots[R.root]=true end
+    for lg in pairs(R.cardHints or {}) do if lg.Parent then roots[lg]=true end end
+    local prefs=prefNames()
+    for lg in pairs(roots) do
+        local ok,desc=pcall(function() return lg:GetDescendants() end)
+        if ok then
+            for i,d in ipairs(desc) do
+                if i>3000 then break end
+                if d:IsA("GuiObject") and d.Visible and visibleChain(d,lg) then
+                    local kids=d:GetChildren()
+                    if #kids>=2 and #kids<=8 then
+                        local cards={}; local prefHit=false
+                        for _,c in ipairs(kids) do
+                            if c:IsA("GuiObject") and c.Visible then
+                                local card=cardPanel(c,lg)
+                                if card then table.insert(cards,card); if prefs[low(card.title)] then prefHit=true end end
+                            end
+                        end
+                        if #cards>=2 and (prefHit or (R.cardHints or {})[lg]) then R.cardRoot=d; R.cardsSeen=true; return end
+                    end
+                end
+            end
+        end
+    end
+end
+local function readRoot()
+    local vals={}; R.hits={}
+    local ok,desc=pcall(function() return R.root:GetDescendants() end); if not ok then return end
+    for i,d in ipairs(desc) do
+        if i>1500 then break end
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and visibleChain(d,R.root) then
+            local kind,v=classify(d.Text)
+            if kind then
+                R.hits[kind]=trim(d.Text)
+                if v~=nil and vals[kind]==nil then vals[kind]=v end
+                -- label/value split ("Floor" label + "12" sibling)
+                if v==nil and d.Parent then
+                    for _,s in ipairs(d.Parent:GetChildren()) do
+                        if s~=d and (s:IsA("TextLabel") or s:IsA("TextButton")) then local n=num(string.match(trim(s.Text),"^([%d,]+)")); if n and vals[kind]==nil then vals[kind]=n end end
+                    end
+                end
+            end
+        end
+    end
+    R.floor=vals.floor; R.points=vals.points; R.enemies=vals.enemies; R.rerolls=vals.rerolls
+end
+local function readCards()
+    R.cards={}
+    if not (R.cardRoot and R.cardRoot.Parent and R.cardRoot.Visible and visibleChain(R.cardRoot,nil)) then R.cardRoot=nil; R.ranked={}; return end
+    for _,c in ipairs(R.cardRoot:GetChildren()) do
+        if c:IsA("GuiObject") and c.Visible then local card=cardPanel(c,R.cardRoot); if card then table.insert(R.cards,card) end end
+    end
+    local names={}; for _,c in ipairs(R.cards) do table.insert(names,c.title) end
+    R.ranked=DG.rank(names)
+end
+-- runtime-discovered card set → card selection becomes a PARTIAL (verified) action
+local function cardSub() for _,s in ipairs(DG.sub) do if s.key=="AutoSelectCards" then return s end end end
+local function clickCenter(btn)
+    local ok,p,s=pcall(function() return btn.AbsolutePosition,btn.AbsoluteSize end)
+    if not ok or s.X<2 or s.Y<2 then return false end
+    local x=math.floor(p.X+s.X*.5); local y=math.floor(p.Y+s.Y*.5)
+    local IA=RAVYN.InputAudit; if IA and IA.note then IA.note("MOUSE","dungeon card","DUNGEON") end
+    return pcall(function() VIM:SendMouseButtonEvent(x,y,0,true,game,0); task.wait(.025); VIM:SendMouseButtonEvent(x,y,0,false,game,0) end)
+end
+local function cardStep(now)
+    local s=cardSub(); if not s then return end
+    if R.cardsSeen and s.status=="UNAVAILABLE" then s.status="PARTIAL"; s.why="Card GUI discovered this session · clicks are verified" end
+    if R.pendingClick then
+        local p=R.pendingClick
+        local gone=not (p.root and p.root.Parent and p.root.Visible) or #R.cards==0
+        if gone then R.clickVerified=R.clickVerified+1; R.clickFails=0; R.pendingClick=nil; R.lastPick=p.title
+        elseif now-p.at>2.5 then
+            R.pendingClick=nil; R.clickFails=R.clickFails+1
+            if R.clickFails>=2 then RAVYN.Config.Ouwi11.AutoSelectCards=false; s.status="UNVERIFIED"; s.why="Card click did not close the card choice · disabled"; R.detail=s.why end
+        end
+        return
+    end
+    if not (RAVYN.Config.Ouwi11.AutoSelectCards and s.status=="PARTIAL") or #R.ranked==0 then return end
+    local best=R.ranked[1]; if not best or best.score==-math.huge then return end
+    for _,c in ipairs(R.cards) do
+        if c.title==best.name then
+            if clickCenter(c.button) then R.clicks=R.clicks+1; R.pendingClick={at=now,title=c.title,root=R.cardRoot} end
+            return
+        end
+    end
+end
+local function tick(now)
+    if not RAVYN.Config.Ouwi11.Enabled then
+        R.status="OFF"; R.detail="Dungeon mode off"; R.root=nil; R.cardRoot=nil; R.cards={}; R.ranked={}; return
+    end
+    if not (R.root and R.root.Parent) then R.root=nil; discover(now) end
+    if not (R.cardRoot and R.cardRoot.Parent) then discoverCards(now) end
+    if now-R.readAt>=1 then
+        R.readAt=now
+        if R.root then readRoot() end
+        readCards()
+    end
+    pcall(cardStep,now)
+    if R.root or R.cardRoot then R.status="READY"; R.detail=R.pendingClick and R.detail or ("Reading "..tostring(R.rootPath or "card panel"))
+    else R.status="SEARCHING"; R.detail="No dungeon HUD found yet (not in Ouwigahara?)" end
+end
+function RAVYN:SetDungeonMode(v)
+    if type(v)~="boolean" then return result(false,"INVALID_CONFIG") end
+    R.discoverAt=-math.huge; R.cardAt=-math.huge
+    return self:SetConfig("Ouwi11.Enabled",v)
+end
+function RAVYN:RediscoverDungeonHud() R.root=nil; R.cardRoot=nil; R.discoverAt=-math.huge; R.cardAt=-math.huge; return result(true,"REDISCOVER") end
+R.token=(R.token or 0)+1
+local token=R.token
+task.spawn(function()
+    while not RAVYN._destroyed and R.token==token do
+        local ok,err=pcall(tick,os.clock())
+        if not ok then RAVYN.Logger:log("WARN","OUWI_READER_TICK",{error=tostring(err)}) end
+        task.wait(RAVYN.Config.Ouwi11.Enabled and .5 or 2)
+    end
+end)
+local baseDestroy=RAVYN.Destroy
+function RAVYN:Destroy() R.token=R.token+1; R.root=nil; R.cardRoot=nil; return baseDestroy(self) end
+CTX["OuwiReader12"]=R
+RAVYN.Logger:log("INFO","OUWI_READER_V12_READY")
+return true]==========]); if not ok then return end end
+do local ok=runChunk("CombatActionBusV122.lua",[==========[local G=(getgenv and getgenv()) or _G
+local CTX=G.__RAVYN_CTX
+local Hooks=CTX.Hooks
+local Util=CTX["Util"]
+local Config=CTX["Config"]
+local result=CTX["result"]
+local RAVYN=CTX["RAVYN"]
+local LiveAction=CTX["LiveAction"]
+local liveRoot=CTX["liveRoot"]
+local liveHumanoid=CTX["liveHumanoid"]
+local targetBasis=CTX["targetBasis"]
+local currentSkillKeys=CTX["currentSkillKeys"]
+local idleLike=CTX["idleLike"]
+local resolveGuardKey=CTX["resolveGuardKey"]
+local evoCfg=CTX["evoCfg"]
+local D=CTX["Direct11"]
+-- The raw physical combat primitives are captured HERE ONLY and are called ONLY by LegacyCombatAdapter below.
+local rawPressKey=CTX["pressKey"]
+local rawMouse=CTX["fixedMouseButton"]
+local rawKeyState=CTX["setKeyState"]
+local rawDodge=CTX["legacyDirectionalDodge"]
+-- RAVYN DIRECT v1.2.2 · Silent Combat
+--
+--   CombatBrain (CombatMobility · CombatEvolution · Smart Skills · InstaKillAdapter)
+--     → RAVYN.CombatActionBus          one execution authority, action state machine, gates, counters
+--       → ActionResolver               SilentActionAdapter.resolve(): finds EXISTING local game actions
+--         → SilentActionAdapter        invokes a verified local game action (backend SILENT_LOCAL)
+--         → LegacyCombatAdapter        key / mouse simulation (backend LEGACY_INPUT) · HYBRID / LEGACY_INPUT only
+--
+-- A silent binding is an action the game itself already exposes on this client:
+--   · a ContextActionService action the game bound (ContextActionService:CallFunction on the game's own handler)
+--   · a callback the game's own UI connected to one of its buttons (fired with firesignal / the connection itself)
+--   · Tool:Activate() on the equipped tool
+-- Listed only, never invoked (arguments / signatures unknown): BindableEvents/Functions, functions found in the game's _G/shared.
+-- Never used: RemoteEvents/RemoteFunctions, require() of game modules, UserInputService handlers with fabricated
+-- InputObjects, VirtualInputManager / VirtualUser / keypress / mouse1press. A binding becomes VERIFIED_SILENT only after
+-- the game produced local evidence (own animation, own damage counter, skill cooldown GUI, displacement) for it.
+-- SILENT mode executes VERIFIED_SILENT bindings only and never falls back to input simulation.
+
+local Players=game:GetService("Players")
+local LP=Players.LocalPlayer
+local function exec(name) local f=(getgenv and getgenv()[name]) or G[name]; return type(f)=="function" and f or nil end
+
+-- ================= config =================
+local MODES={SILENT=true,HYBRID=true,LEGACY_INPUT=true}
+Config.Default.CombatInputMode="SILENT"
+if not MODES[RAVYN.Config.CombatInputMode] then RAVYN.Config.CombatInputMode="SILENT" end
+local scDefaults={VerifyConfirmations=2,MaxCandidates=3,DemoteAfterNoEvidence=4,Verified={}}
+Config.Default.SilentCombat=Util.deepCopy(scDefaults)
+RAVYN.Config.SilentCombat=Util.deepMerge(scDefaults,RAVYN.Config.SilentCombat or {})
+local validateBaseV122=Config.validate
+function Config.validate(c)
+    local _,errors=validateBaseV122(c)
+    errors=errors or {}
+    if c.CombatInputMode~=nil and not MODES[c.CombatInputMode] then table.insert(errors,"CombatInputMode") end
+    return #errors==0,errors
+end
+local function scfg() return RAVYN.Config.SilentCombat end
+
+-- ================= evidence (all local reads; nothing is sent) =================
+local EV={}
+local ACTION_WORDS={"block","guard","parry","dash","dodge","roll","attack","skill","cast","combo","action","heavy","evade","counter"}
+local function actionWord(s) s=string.lower(tostring(s or "")); for _,w in ipairs(ACTION_WORDS) do if string.find(s,w,1,true) then return true end end; return false end
+-- locomotion / ambient tracks are never evidence of a combat action
+local AMBIENT={"idle","walk","run","jump","fall","land","breath","stand","locomotion","climb","swim","sit","toolnone","emote","dance","wave","cheer","laugh","point"}
+local function isIdle(name)
+    local l=string.lower(tostring(name or ""))
+    for _,w in ipairs(AMBIENT) do if string.find(l,w,1,true) then return true end end
+    if idleLike then local ok,v=pcall(idleLike,name); if ok and v then return true end end
+    return false
+end
+function EV.tracks()
+    local out={}
+    local h=liveHumanoid(); if not h then return out end
+    local ok,an=pcall(function() return h:FindFirstChildOfClass("Animator") end)
+    if not ok or not an then return out end
+    local ok2,list=pcall(function() return an:GetPlayingAnimationTracks() end)
+    if not ok2 or type(list)~="table" then return out end
+    for i,tr in ipairs(list) do
+        if i>24 then break end
+        local ok3,id,name,tp,looped=pcall(function() local a=tr.Animation; return a and a.AnimationId or "",a and a.Name or "",tr.TimePosition,tr.Looped end)
+        if ok3 then out[tr]={id=tostring(id or ""),name=tostring(name or ""),tp=tonumber(tp) or 0,looped=looped==true} end
+    end
+    return out
+end
+function EV.targetHum(target)
+    local RA=RAVYN.ReadAdapter; local raw=RA and RA.lastEntities and target and target.id and RA.lastEntities[target.id]
+    if not raw then return nil end
+    local ok,h=pcall(function() return RA:_entityHumanoid(raw) end)
+    return ok and h or nil
+end
+function EV.hpFrac(h)
+    if not h then return nil end
+    local ok,hp,mx=pcall(function() return h.Health,h.MaxHealth end)
+    if ok and tonumber(hp) and tonumber(mx) and mx>0 then return hp/mx,hp,mx end
+    return nil
+end
+local progressAt,progressNode=-math.huge,nil
+function EV.progress()
+    if progressNode and progressNode.Parent then return progressNode end
+    local now=os.clock(); if now-progressAt<5 then return nil end; progressAt=now
+    local SCH=RAVYN.RuntimeSchema; if not (SCH and SCH.get) then return nil end
+    local ok,s=pcall(SCH.get); local n=(ok and s and s.nodes) or {}
+    for _,r in ipairs({n.sectionRoot,n.playerData}) do
+        if r and r.Parent then local p=r:FindFirstChild("Progress"); if p then progressNode=p; return p end end
+    end
+    return nil
+end
+function EV.damageDealt()
+    local p=EV.progress(); local v=p and p:FindFirstChild("damage_dealt")
+    if v and v:IsA("ValueBase") then return tonumber(v.Value) end
+    return nil
+end
+function EV.slot(index)
+    local pg=LP and LP:FindFirstChildOfClass("PlayerGui"); local a=pg and pg:FindFirstChild("ComponentsHolder")
+    a=a and a:FindFirstChild("BottomHolder"); a=a and a:FindFirstChild("SkillsHolder")
+    return a and a:FindFirstChild(tostring(index).."-Skill") or nil
+end
+function EV.slotSig(index)
+    local slot=EV.slot(index); if not slot then return nil end
+    local ok,desc=pcall(function() return slot:GetDescendants() end); if not ok then return nil end
+    local out={}
+    for i,d in ipairs(desc) do
+        if i>80 then break end
+        if d:IsA("GuiObject") and d.Name~="KeyLabel" then
+            local s=d.Name..(d.Visible and "1" or "0")..string.format("%.2f,%.2f",d.Size.X.Scale,d.Size.Y.Scale)..string.format("%.2f",d.BackgroundTransparency)
+            if d:IsA("ImageLabel") or d:IsA("ImageButton") then s=s..string.format("i%.2f",d.ImageTransparency) end
+            if d:IsA("TextLabel") or d:IsA("TextButton") then s=s.."t"..string.sub(d.Text,1,12) end
+            table.insert(out,s)
+        end
+    end
+    return table.concat(out,"|")
+end
+function EV.attrs()
+    local h=liveHumanoid(); local out={}
+    if not h then return out end
+    for tag,o in pairs({C=h.Parent,H=h}) do
+        if o then
+            local ok,a=pcall(function() return o:GetAttributes() end)
+            if ok and type(a)=="table" then for k,v in pairs(a) do local t=type(v); if t=="boolean" or t=="number" or t=="string" then out[tag.."."..tostring(k)]=v end end end
+        end
+    end
+    return out
+end
+function EV.snap(cap,target,skill)
+    local s={cap=cap,at=os.clock(),tracks=EV.tracks(),dmg=EV.damageDealt()}
+    local h=EV.targetHum(target)
+    if h then local ok,hp=pcall(function() return h.Health end); if ok and tonumber(hp) then s.hum=h; s.hp=tonumber(hp) end end
+    if skill and skill.index then s.slotIndex=skill.index; s.slot=EV.slotSig(skill.index) end
+    if cap=="GUARD" or cap=="PARRY" then s.attrs=EV.attrs() end
+    if cap=="DASH" then local r=liveRoot(); s.pos=r and r.Position end
+    return s
+end
+function EV.evaluate(s)
+    local ev={}
+    for tr,info in pairs(EV.tracks()) do
+        if not isIdle(info.name) then
+            local old=s.tracks[tr]
+            if not old then ev.ANIMATION=(info.name~="" and info.name) or info.id; break end
+            -- a restarted one-shot track (looped tracks wrap on their own and prove nothing)
+            if not info.looped and info.tp+.05<old.tp then ev.ANIMATION_RESTART=(info.name~="" and info.name) or info.id; break end
+        end
+    end
+    if s.hum and s.hp then local ok,hp=pcall(function() return s.hum.Health end); hp=ok and tonumber(hp) or nil; if hp and hp<s.hp then ev.TARGET_HP=s.hp-hp end end
+    if s.dmg then local d=EV.damageDealt(); if d and d>s.dmg then ev.DAMAGE_DEALT=d-s.dmg end end
+    if s.slotIndex and s.slot then local sig=EV.slotSig(s.slotIndex); if sig and sig~=s.slot then ev.SLOT_COOLDOWN=true end end
+    if s.pos then
+        local r=liveRoot(); local M=RAVYN.CombatMobility
+        if r and not (M and M.flightActive) then local d=(r.Position-s.pos).Magnitude; if d>=4 then ev.DISPLACEMENT=d end end
+    end
+    if s.attrs then for k,v in pairs(EV.attrs()) do if s.attrs[k]~=v and (type(v)=="boolean" or actionWord(k)) then ev.STATE_ATTR=k; break end end end
+    return ev
+end
+local EVIDENCE_ORDER={"SLOT_COOLDOWN","DAMAGE_DEALT","TARGET_HP","ANIMATION","ANIMATION_RESTART","DISPLACEMENT","STATE_ATTR"}
+-- evidence that can only come from THIS client's own action (TARGET_HP alone could be another player's hit)
+local LOCAL_EVIDENCE={SLOT_COOLDOWN=true,DAMAGE_DEALT=true,ANIMATION=true,ANIMATION_RESTART=true,DISPLACEMENT=true,STATE_ATTR=true}
+function EV.first(ev) for _,k in ipairs(EVIDENCE_ORDER) do if ev[k]~=nil then return k end end; return nil end
+function EV.text(ev) local t={}; for _,k in ipairs(EVIDENCE_ORDER) do if ev[k]~=nil then table.insert(t,k) end end; return table.concat(t,"+") end
+function EV.localOnly(ev) for k in pairs(LOCAL_EVIDENCE) do if ev[k]~=nil then return true end end; return false end
+RAVYN.CombatEvidence=EV
+
+-- ================= bus state (defined first: the audit and both adapters report into it) =================
+local B={seq=0,execCount=0,silentCount=0,legacyCount=0,finisherCount=0,testExecs=0,rejects={},lastReject=nil,
+    fight=nil,lastFight=nil,guardDown=false,guardAt=0,guardBackend=nil,guardBinding=nil,guardKey=nil,defenseUntil=0,
+    cooldown={},dmg={},pendingDmg=nil,token=0,history={},lastAction=nil,modeChangedAt=0}
+local CH={OFFENSE={name="OFFENSE",state="READY",current=nil,lockUntil=0,readyAt=0,last=nil},
+    DEFENSE={name="DEFENSE",state="READY",current=nil,lockUntil=0,readyAt=0,last=nil}}
+B.ch=CH
+RAVYN.CombatActionBus=B
+function B.mode() local m=RAVYN.Config.CombatInputMode; return MODES[m] and m or "SILENT" end
+
+-- ================= InputAudit: every physical input RAVYN makes is scoped, counted and (for combat) gated =================
+-- Each RAVYN physical-input primitive calls A.physical() before it injects anything.
+--   LEGACY_COMBAT  : LegacyCombatAdapter · allowed in HYBRID / LEGACY_INPUT, blocked in SILENT
+--   LEGACY_RELEASE : releasing a key RAVYN itself is holding · always allowed (safety)
+--   LOOT/UI/...    : declared non-combat callers · allowed
+--   UNSCOPED       : someone bypassed the bus · always blocked
+local A={total=0,nonBus=0,blocked=0,byScope={},events={},scopes=setmetatable({},{__mode="k"})}
+RAVYN.InputAudit=A
+local NONCOMBAT={LOOT=true,UI=true,DIALOGUE=true,CROW=true,DUNGEON=true,ANTI_AFK=true}
+local function coKey() return coroutine.running() or "main" end
+function A.scope() return A.scopes[coKey()] or "UNSCOPED" end
+function A.withScope(scope,fn,...)
+    local k=coKey(); local prev=A.scopes[k]; A.scopes[k]=scope
+    local r=table.pack(pcall(fn,...))
+    A.scopes[k]=prev
+    if not r[1] then return false,"INPUT_ERROR:"..tostring(r[2]) end
+    return table.unpack(r,2,r.n)
+end
+local function pushEvent(ev) table.insert(A.events,ev); while #A.events>16 do table.remove(A.events,1) end end
+function A.physical(kind,detail)
+    local scope=A.scope(); local allowed,why=true,nil
+    if scope=="LEGACY_COMBAT" then
+        if B.mode()=="SILENT" then allowed,why=false,"SILENT_MODE" end
+    elseif scope=="LEGACY_RELEASE" then
+        -- release of a key RAVYN holds
+    elseif not NONCOMBAT[scope] then allowed,why=false,"BYPASS_NOT_VIA_COMBAT_BUS" end
+    local combat=(scope=="LEGACY_COMBAT" or scope=="LEGACY_RELEASE" or scope=="UNSCOPED")
+    pushEvent({at=os.clock(),kind=tostring(kind),detail=tostring(detail or ""),scope=scope,allowed=allowed,why=why})
+    local f=B.fight
+    if allowed then
+        A.total=A.total+1; A.byScope[scope]=(A.byScope[scope] or 0)+1
+        if not combat then A.nonBus=A.nonBus+1 end
+        if f then if combat then f.physicalCombat=f.physicalCombat+1 else f.physicalOther=f.physicalOther+1 end end
+    else
+        A.blocked=A.blocked+1; A.lastBlocked={kind=kind,detail=tostring(detail or ""),scope=scope,why=why,at=os.clock()}
+        if f then f.blocked=f.blocked+1 end
+        if os.clock()-(A.lastBlockLog or -math.huge)>1 then
+            A.lastBlockLog=os.clock()
+            RAVYN.Logger:log("WARN","INPUT_BLOCKED · "..tostring(kind).." "..tostring(detail).." · "..scope.." · "..tostring(why),{})
+        end
+    end
+    return allowed,why
+end
+-- menu / dialogue / loot input that does not go through a gated primitive (never combat)
+function A.note(kind,detail,scope)
+    scope=NONCOMBAT[scope] and scope or "UI"
+    pushEvent({at=os.clock(),kind=tostring(kind),detail=tostring(detail or ""),scope=scope,allowed=true})
+    A.total=A.total+1; A.nonBus=A.nonBus+1; A.byScope[scope]=(A.byScope[scope] or 0)+1
+    local f=B.fight; if f then f.physicalOther=f.physicalOther+1 end
+end
+
+-- ================= LegacyCombatAdapter: the ONLY combat user of pressMouse1/2 · pressKey · setKeyState · VIM dodge =================
+local LEGACY={count=0,releases=0,byKind={},last=nil}
+local function legacyScoped(kind,detail,scope,fn)
+    LEGACY.count=LEGACY.count+1; LEGACY.byKind[kind]=(LEGACY.byKind[kind] or 0)+1; LEGACY.last={kind=kind,detail=tostring(detail),at=os.clock()}
+    return A.withScope(scope,fn)
+end
+function LEGACY.dispatch(a)
+    if B.mode()=="SILENT" then return false,"LEGACY_BLOCKED_IN_SILENT" end
+    if a.cap=="ATTACK" then
+        if type(rawMouse)~="function" then return false,"LEGACY_MOUSE_UNAVAILABLE" end
+        return legacyScoped(a.heavy and "M2" or "M1",a.kind,"LEGACY_COMBAT",function() return rawMouse(a.heavy and 1 or 0) end)
+    elseif a.cap=="SKILL" then
+        if type(rawPressKey)~="function" then return false,"LEGACY_KEY_UNAVAILABLE" end
+        return legacyScoped("KEY",a.skill.key,"LEGACY_COMBAT",function() return rawPressKey(a.skill.key) end)
+    elseif a.cap=="GUARD" then
+        if not a.guardKey or type(rawKeyState)~="function" then return false,"GUARD_KEY_UNRESOLVED" end
+        return legacyScoped("GUARD",a.guardKey,"LEGACY_COMBAT",function() return rawKeyState(a.guardKey,true) end)
+    elseif a.cap=="DASH" then
+        if type(rawDodge)~="function" then return false,"LEGACY_DODGE_UNAVAILABLE" end
+        return legacyScoped("DASH",a.direction,"LEGACY_COMBAT",function() return rawDodge(a.direction) end)
+    elseif a.cap=="PARRY" then
+        local key=a.guardKey; if not key or type(rawKeyState)~="function" then return false,"PARRY_KEY_UNRESOLVED" end
+        return legacyScoped("PARRY",key,"LEGACY_COMBAT",function()
+            local ok,src=rawKeyState(key,true); if not ok then return false,src end
+            task.wait(.06); A.withScope("LEGACY_RELEASE",function() return rawKeyState(key,false) end)
+            return true,"LEGACY_PARRY_TAP"
+        end)
+    end
+    return false,"LEGACY_UNKNOWN_ACTION"
+end
+function LEGACY.release(key)
+    if not key or type(rawKeyState)~="function" then return false,"NO_KEY" end
+    LEGACY.releases=LEGACY.releases+1
+    return legacyScoped("GUARD_UP",key,"LEGACY_RELEASE",function() return rawKeyState(key,false) end)
+end
+RAVYN.LegacyCombatAdapter={GetStatus=function()
+    return {count=LEGACY.count,releases=LEGACY.releases,byKind=Util.deepCopy(LEGACY.byKind),last=LEGACY.last,
+        allowedIn="HYBRID (only for an action without a verified silent binding) · LEGACY_INPUT",backend="LEGACY_INPUT",silent=false}
+end}
+
+-- ================= SilentActionAdapter + ActionResolver =================
+local SA={caps={},skills={},gen=0,resolvedAt=-math.huge,reason="NOT_RESOLVED",dirty="BOOT",dirtyAt=0,sig={},api={},
+    listed={cas={},bindables={},controllers={}},testing=false,test=nil,lastTest=nil,lastTriggerCheck=0}
+RAVYN.SilentActionAdapter=SA
+RAVYN.SilentCombatAdapter=SA -- v1.2.1 name kept as an alias for old references
+local CAS_DENY={moveForwardAction=true,moveBackwardAction=true,moveLeftAction=true,moveRightAction=true,jumpAction=true}
+local WORDS={PARRY={"parry","counter","deflect"},HEAVY={"heavy","m2"},GUARD={"block","guard","defend"},DASH={"dash","dodge","roll","evade"},ATTACK={"attack","punch","swing","m1"}}
+local WORD_ORDER={"PARRY","HEAVY","GUARD","DASH","ATTACK"}
+local function hasToken(s,w) return s==w or string.sub(s,1,#w)==w or string.find(s,"[^%a]"..w)~=nil end
+local function wordCap(s)
+    s=string.lower(tostring(s or "")); if s=="" then return nil end
+    for _,cap in ipairs(WORD_ORDER) do for _,w in ipairs(WORDS[cap]) do if hasToken(s,w) or (#w>4 and string.find(s,w,1,true)) then return cap end end end
+    return nil
+end
+SA.wordCap=wordCap
+function SA.casList()
+    local out={}
+    local ok,cas=pcall(function() return game:GetService("ContextActionService") end)
+    if not ok or not cas then return out,nil end
+    local ok2,all=pcall(function() return cas:GetAllBoundActionInfo() end)
+    if not ok2 or type(all)~="table" then return out,cas end
+    local n=0
+    for name,info in pairs(all) do
+        n=n+1; if n>80 then break end
+        name=tostring(name)
+        if not CAS_DENY[name] and string.lower(string.sub(name,1,3))~="rbx" then
+            local inputs={}
+            local list=(type(info)=="table") and info.inputTypes or nil
+            if type(list)=="table" then for _,it in ipairs(list) do local okN,nm=pcall(function() return it.Name end); if okN and nm then table.insert(inputs,tostring(nm)) end end end
+            table.insert(out,{name=name,inputs=inputs})
+        end
+    end
+    table.sort(out,function(a,b) return a.name<b.name end)
+    return out,cas
+end
+-- number of callbacks the game connected to a signal (C-side / core connections excluded); nil = cannot inspect.
+-- RAVYN never connects to the game's own buttons, so every script connection found here belongs to the game.
+local function gameCallbacks(signal)
+    local gc=exec("getconnections"); if not gc then return nil end
+    local ok,list=pcall(gc,signal); if not ok or type(list)~="table" then return 0 end
+    local n=0
+    for _,c in ipairs(list) do
+        local ok2,foreign=pcall(function() return c.ForeignState end)
+        if ok2 and foreign~=true then n=n+1 end
+    end
+    return n
+end
+local function underSkills(node)
+    local p=node.Parent; local i=0
+    while p and i<10 do if p.Name=="SkillsHolder" then return true end; p=p.Parent; i=i+1 end
+    return false
+end
+local function buttonBinding(btn,cap,rank,key,index)
+    local canInspect=exec("getconnections")~=nil
+    local info={}
+    for _,sn in ipairs({"MouseButton1Click","Activated","MouseButton1Down","MouseButton1Up"}) do
+        local ok,sig=pcall(function() return btn[sn] end)
+        info[sn]=(ok and sig) and gameCallbacks(sig) or nil
+    end
+    local tap=nil
+    if canInspect then
+        if (info.MouseButton1Click or 0)>0 then tap="MouseButton1Click" elseif (info.Activated or 0)>0 then tap="Activated" elseif (info.MouseButton1Down or 0)>0 then tap="MouseButton1Down" end
+        if not tap then return nil end -- the game's UI does not listen to this button
+    else
+        tap="MouseButton1Click"
+    end
+    local total=0; for _,v in pairs(info) do total=total+(v or 0) end
+    local path="?"; pcall(function() path=btn:GetFullName() end)
+    return {id="GUI:"..path.."@"..tap,kind="GUI",cap=cap,key=key,index=index,inst=btn,tap=tap,
+        down=(canInspect and (info.MouseButton1Down or 0)>0) and "MouseButton1Down" or nil,
+        up=(canInspect and (info.MouseButton1Up or 0)>0) and "MouseButton1Up" or nil,
+        callbacks=canInspect and total or nil,rank=rank+(canInspect and 0 or 3),
+        label="UI callback · "..tostring(btn.Name).."."..tap..(canInspect and (" · "..total.." game callback"..(total==1 and "" or "s")) or " · callbacks not inspectable")}
+end
+local function slotButtons(index)
+    local slot=EV.slot(index); if not slot then return {} end
+    local out={}
+    if slot:IsA("GuiButton") then table.insert(out,slot) end
+    local ok,desc=pcall(function() return slot:GetDescendants() end)
+    if ok then for i,d in ipairs(desc) do if i>60 then break end; if d:IsA("GuiButton") then table.insert(out,d) end end end
+    return out
+end
+-- bounded walk over the game's own ScreenGuis (RAVYN's GUIs excluded) · only when resolving, never per tick
+local function actionButtons()
+    local pg=LP and LP:FindFirstChildOfClass("PlayerGui"); if not pg then return {} end
+    local out={}; local queue={}; local head=1; local visited=0
+    for _,g in ipairs(pg:GetChildren()) do
+        if string.sub(tostring(g.Name),1,5)~="RAVYN" and g~=RAVYN._gui then table.insert(queue,{g,0}) end
+    end
+    while head<=#queue and visited<2500 do
+        local node,depth=queue[head][1],queue[head][2]; head=head+1; visited=visited+1
+        local okB,isBtn=pcall(function() return node:IsA("GuiButton") end)
+        if okB and isBtn and not underSkills(node) then
+            local cap=wordCap(node.Name)
+            if not cap then local okT,t=pcall(function() return node.Text end); if okT then cap=wordCap(t) end end
+            if cap then table.insert(out,{btn=node,cap=cap}) end
+        end
+        if depth<12 then local ok,ch=pcall(function() return node:GetChildren() end); if ok then for _,c in ipairs(ch) do table.insert(queue,{c,depth+1}) end end end
+    end
+    return out
+end
+local function toolCandidate()
+    local h=liveHumanoid(); local ch=h and h.Parent; if not ch then return nil end
+    local ok,tool=pcall(function() return ch:FindFirstChildOfClass("Tool") end)
+    if not ok or not tool then return nil end
+    local okS,sig=pcall(function() return tool.Activated end)
+    local n=(okS and sig) and gameCallbacks(sig) or nil
+    return {id="TOOL:"..tostring(tool.Name),kind="TOOL",cap="ATTACK",inst=tool,rank=(n and n>0) and 2 or 5,callbacks=n,
+        label="Tool:Activate() · "..tostring(tool.Name)..((n==nil) and " · callbacks not inspectable" or (" · "..n.." local Activated callback"..(n==1 and "" or "s")))}
+end
+local function listBindables()
+    local out={}; local roots={}
+    pcall(function() table.insert(roots,game:GetService("ReplicatedStorage")) end)
+    pcall(function() local ps=LP:FindFirstChild("PlayerScripts"); if ps then table.insert(roots,ps) end end)
+    pcall(function() local h=liveHumanoid(); if h and h.Parent then table.insert(roots,h.Parent) end end)
+    local seen=0
+    for _,r in ipairs(roots) do
+        local queue={{r,0}}; local head=1
+        while head<=#queue and seen<1500 and #out<12 do
+            local node,depth=queue[head][1],queue[head][2]; head=head+1; seen=seen+1
+            local okB,isB=pcall(function() return node:IsA("BindableEvent") or node:IsA("BindableFunction") end)
+            if okB and isB and (wordCap(node.Name) or string.find(string.lower(tostring(node.Name)),"skill",1,true)) then
+                local p="?"; pcall(function() p=node:GetFullName() end); table.insert(out,p)
+            end
+            if depth<5 and node.Name~="Player_Service" then local ok,ch=pcall(function() return node:GetChildren() end); if ok then for _,c in ipairs(ch) do table.insert(queue,{c,depth+1}) end end end
+        end
+    end
+    return out
+end
+local function listControllers()
+    local out={}; local envs={}
+    local gr=exec("getrenv")
+    if gr then
+        local ok,e=pcall(gr)
+        if ok and type(e)=="table" then
+            local okG,g=pcall(function() return rawget(e,"_G") end); if okG and type(g)=="table" then table.insert(envs,{"_G",g}) end
+            local okS,s=pcall(function() return rawget(e,"shared") end); if okS and type(s)=="table" then table.insert(envs,{"shared",s}) end
+        end
+    end
+    for _,pair in ipairs(envs) do
+        pcall(function()
+            local n=0
+            for k,v in next,pair[2] do
+                n=n+1; if n>200 or #out>=10 then break end
+                if type(v)=="function" and wordCap(k) then table.insert(out,pair[1].."."..tostring(k).."()")
+                elseif type(v)=="table" then
+                    local m=0
+                    for k2,v2 in next,v do
+                        m=m+1; if m>80 or #out>=10 then break end
+                        if type(v2)=="function" and (wordCap(k2) or string.find(string.lower(tostring(k2)),"skill",1,true)) then table.insert(out,pair[1].."."..tostring(k).."."..tostring(k2).."()") end
+                    end
+                end
+            end
+        end)
+    end
+    return out
+end
+local function capState(cap) return {cap=cap,status="UNAVAILABLE",binding=nil,candidates={},reason="NO_LOCAL_ACTION_FOUND"} end
+local function addCand(st,b) if st and b then table.insert(st.candidates,b) end end
+local function currentSig()
+    local h=liveHumanoid(); local ch=h and h.Parent; local tool=nil
+    if ch then local ok,t=pcall(function() return ch:FindFirstChildOfClass("Tool") end); tool=ok and t or nil end
+    local AI=RAVYN.AdaptiveIntel; local M=RAVYN.CombatMobility
+    local keys={}; for _,k in ipairs((M and M.skillKeys) or {}) do table.insert(keys,tostring(k.index)..":"..tostring(k.key)) end
+    return {char=(LP and LP.Character) or ch,tool=tool,loadout=AI and AI.loadoutGeneration or 0,skills=table.concat(keys,",")}
+end
+function SA.bindingFor(capKey)
+    if type(capKey)~="string" then return nil end
+    if string.sub(capKey,1,6)=="SKILL:" then return SA.skills[string.sub(capKey,7)] end
+    return SA.caps[capKey]
+end
+function SA.capStatus(cap)
+    if cap=="SKILL" then
+        local n,v,p=0,0,0
+        for _,st in pairs(SA.skills) do n=n+1; if st.status=="VERIFIED_SILENT" then v=v+1 elseif st.status=="PARTIAL" then p=p+1 end end
+        if n==0 then return "UNAVAILABLE","no hotbar skills read" end
+        if v==n then return "VERIFIED_SILENT",v.."/"..n.." skills verified" end
+        if v>0 or p>0 then return "PARTIAL",v.."/"..n.." verified · "..p.." candidate"..(p==1 and "" or "s") end
+        return "UNAVAILABLE","0/"..n.." skills have a local action"
+    end
+    local st=SA.caps[cap]; if not st then return "UNAVAILABLE","not resolved yet" end
+    return st.status,st.reason
+end
+function SA.summary()
+    local parts={}
+    for _,c in ipairs({"ATTACK","SKILL","GUARD","DASH","PARRY"}) do local s=SA.capStatus(c); table.insert(parts,c.." "..s) end
+    return table.concat(parts," · ")
+end
+function SA.resolve(reason)
+    local now=os.clock()
+    SA.gen=SA.gen+1; SA.resolvedAt=now; SA.reason=tostring(reason or "MANUAL"); SA.dirty=nil
+    SA.api={getconnections=exec("getconnections")~=nil,firesignal=exec("firesignal")~=nil,cas=false,getrenv=exec("getrenv")~=nil}
+    local caps={ATTACK=capState("ATTACK"),HEAVY=capState("HEAVY"),GUARD=capState("GUARD"),DASH=capState("DASH"),PARRY=capState("PARRY")}
+    local skills={}
+    local okK,keys=pcall(currentSkillKeys); keys=(okK and keys) or {}
+    for _,k in ipairs(keys) do skills[k.key]={cap="SKILL",key=k.key,index=k.index,status="UNAVAILABLE",binding=nil,candidates={},reason="NO_LOCAL_ACTION_FOUND"} end
+    -- hotbar / guard / dodge keys are IDENTIFIERS here: they name which game action to look for
+    local guardKey=nil; pcall(function() guardKey=(resolveGuardKey(now)) end)
+    local dodgeKey="Q"; pcall(function() dodgeKey=string.upper(tostring(evoCfg().Defense.DodgeKey or "Q")) end)
+    -- 1) ContextActionService actions the game bound itself
+    local acts,cas=SA.casList(); SA.api.cas=cas~=nil; SA.listed.cas={}
+    for _,a in ipairs(acts) do
+        local inputs=table.concat(a.inputs,",")
+        table.insert(SA.listed.cas,a.name.." ["..inputs.."]")
+        local function mk(cap,rank,key) return {id="CAS:"..a.name,kind="CAS",cap=cap,key=key,name=a.name,cas=cas,rank=rank,label="CAS action · "..a.name.." ["..inputs.."]"} end
+        local function has(nm) for _,x in ipairs(a.inputs) do if x==nm then return true end end; return false end
+        local matched=false
+        for key,st in pairs(skills) do if has(key) then local b=mk("SKILL",1,key); b.index=st.index; addCand(st,b); matched=true end end
+        if has("MouseButton1") then addCand(caps.ATTACK,mk("ATTACK",1)); matched=true end
+        if has("MouseButton2") then addCand(caps.HEAVY,mk("HEAVY",1)); matched=true end
+        if guardKey and has(guardKey) and not skills[guardKey] then addCand(caps.GUARD,mk("GUARD",1)); matched=true end
+        if dodgeKey and has(dodgeKey) and not skills[dodgeKey] then addCand(caps.DASH,mk("DASH",1)); matched=true end
+        if not matched then local cap=wordCap(a.name); if cap then addCand(caps[cap],mk(cap,4)) end end
+    end
+    -- 2) callbacks the game's own UI connected to its buttons (hotbar slots + action buttons)
+    if SA.api.firesignal or SA.api.getconnections then
+        for key,st in pairs(skills) do for _,btn in ipairs(slotButtons(st.index)) do addCand(st,buttonBinding(btn,"SKILL",2,key,st.index)) end end
+        for _,x in ipairs(actionButtons()) do addCand(caps[x.cap],buttonBinding(x.btn,x.cap,3)) end
+    end
+    -- 3) Tool activation API
+    addCand(caps.ATTACK,toolCandidate())
+    -- listed only (never invoked)
+    SA.listed.bindables=listBindables(); SA.listed.controllers=listControllers()
+    local ver=scfg().Verified or {}
+    local function choose(st,capKey)
+        table.sort(st.candidates,function(x,y) return x.rank<y.rank end)
+        while #st.candidates>6 do table.remove(st.candidates) end
+        local pv=ver[capKey]
+        if type(pv)=="table" then
+            for _,b in ipairs(st.candidates) do if pv.id==b.id then b.verified=true; b.restored=true; b.lastEvidence=pv.evidence; st.binding=b; break end end
+        end
+        st.binding=st.binding or st.candidates[1]
+        if st.binding and st.binding.verified then st.status="VERIFIED_SILENT"; st.reason="verified earlier ("..tostring(st.binding.lastEvidence)..") · re-confirmed on use"
+        elseif st.binding then st.status="PARTIAL"; st.reason="local action found · not verified yet"
+        else st.status="UNAVAILABLE"; st.reason=(SA.api.cas or SA.api.getconnections or SA.api.firesignal) and "no local game action found" or "executor exposes no inspection API" end
+    end
+    for cap,st in pairs(caps) do choose(st,cap) end
+    for key,st in pairs(skills) do choose(st,"SKILL:"..key) end
+    SA.caps=caps; SA.skills=skills; SA.sig=currentSig()
+    RAVYN.Logger:log("INFO","SILENT_RESOLVE · "..SA.reason.." · "..SA.summary(),{})
+    if not SA.toldUser and B.mode()=="SILENT" and caps.ATTACK.status~="VERIFIED_SILENT" and D and D.event then
+        SA.toldUser=true
+        D.event("Combat input is SILENT: attack "..caps.ATTACK.status.." · nothing is sent until a local action is verified (Combat → Input engine → Verify) · or choose Hybrid","warn")
+    end
+    return result(true,"SILENT_RESOLVED",SA.summary())
+end
+-- invoke a silent binding. phase: TAP | DOWN | UP. Never loops, never retries, never touches input simulation.
+local function fireSignal(b,sn,args)
+    local okS,sig=pcall(function() return b.inst[sn] end); if not okS or not sig then return false,"SIGNAL_MISSING" end
+    local fs=exec("firesignal")
+    if fs then local ok,err=pcall(fs,sig,table.unpack(args)); return ok,ok and ("firesignal "..sn) or ("FIRESIGNAL_ERROR:"..tostring(err)) end
+    local gc=exec("getconnections"); if not gc then return false,"NO_FIRESIGNAL" end
+    local okL,list=pcall(gc,sig); if not okL or type(list)~="table" then return false,"GETCONNECTIONS_FAILED" end
+    local fired=0
+    for _,c in ipairs(list) do
+        pcall(function()
+            local fn,foreign=c.Function,c.ForeignState
+            if foreign==true or type(fn)~="function" then return end
+            if type(c.Fire)=="function" then c:Fire(table.unpack(args)) else task.spawn(fn,table.unpack(args)) end
+            fired=fired+1
+        end)
+    end
+    return fired>0,fired>0 and ("connection:Fire "..sn.." ×"..fired) or "NO_GAME_CALLBACK_FIRED"
+end
+local function silentInvoke(b,phase)
+    phase=phase or "TAP"
+    if not b then return false,"NO_BINDING" end
+    if b.kind=="CAS" then
+        local cas=b.cas; if not cas then return false,"CAS_UNAVAILABLE" end
+        local function call(state) return pcall(function() return cas:CallFunction(b.name,state,nil) end) end
+        if phase=="UP" then local ok,err=call(Enum.UserInputState.End); return ok,ok and "CAS:CallFunction End" or ("CAS_ERROR:"..tostring(err)) end
+        local ok,err=call(Enum.UserInputState.Begin)
+        if not ok then return false,"CAS_ERROR:"..tostring(err) end
+        if phase=="TAP" then task.delay(.05,function() pcall(function() cas:CallFunction(b.name,Enum.UserInputState.End,nil) end) end) end
+        return true,"CAS:CallFunction "..(phase=="TAP" and "Begin/End" or "Begin")
+    elseif b.kind=="GUI" then
+        if not (b.inst and b.inst.Parent) then return false,"UI_BUTTON_GONE" end
+        local sn=(phase=="DOWN" and b.down) or (phase=="UP" and b.up) or b.tap
+        if not sn then return false,"NO_"..phase.."_SIGNAL" end
+        local args={}
+        if sn=="MouseButton1Down" or sn=="MouseButton1Up" then
+            local okP,p,s=pcall(function() return b.inst.AbsolutePosition,b.inst.AbsoluteSize end)
+            if okP and p and s then args={math.floor(p.X+s.X/2),math.floor(p.Y+s.Y/2)} end
+        end
+        local ok,src=fireSignal(b,sn,args)
+        if ok and phase=="TAP" and sn=="MouseButton1Down" and b.up then task.delay(.05,function() pcall(fireSignal,b,b.up,args) end) end
+        return ok,src
+    elseif b.kind=="TOOL" then
+        if not (b.inst and b.inst.Parent) then return false,"TOOL_GONE" end
+        local ok,err=pcall(function() b.inst:Activate() end)
+        return ok,ok and "Tool:Activate()" or ("TOOL_ERROR:"..tostring(err))
+    end
+    return false,"UNKNOWN_BINDING"
+end
+local function persistVerified(capKey,b,evidence)
+    local v=Util.deepCopy(scfg().Verified or {})
+    if b then v[capKey]={id=b.id,at=os.time(),evidence=tostring(evidence or "")} else v[capKey]=nil end
+    pcall(function() RAVYN:SetConfig("SilentCombat.Verified",v) end)
+end
+local function markVerified(capKey,st,b,evidence)
+    b.verified=true; b.restored=false; b.noEvidence=0; b.lastEvidence=evidence
+    st.binding=b; st.status="VERIFIED_SILENT"; st.reason="verified · "..tostring(evidence)
+    persistVerified(capKey,b,evidence)
+    RAVYN.Logger:log("INFO","SILENT_VERIFIED · "..capKey.." · "..b.label.." · "..tostring(evidence),{})
+end
+-- in-combat bookkeeping: a VERIFIED binding that keeps producing no local evidence is demoted, never kept silently
+local function bindingOutcome(a,confirmed,evidence)
+    local st=SA.bindingFor(a.capKey); local b=a.bindingRef
+    if not (st and b and st.binding==b) then return end
+    if confirmed then b.noEvidence=0; b.restored=false; b.lastEvidence=evidence; return end
+    b.noEvidence=(b.noEvidence or 0)+1
+    local limit=b.restored and 3 or (tonumber(scfg().DemoteAfterNoEvidence) or 4)
+    if b.verified and b.noEvidence>=limit then
+        b.verified=false; st.status="PARTIAL"; st.reason="demoted · no local evidence in "..b.noEvidence.." uses"
+        persistVerified(a.capKey,nil)
+        RAVYN.Logger:log("WARN","SILENT_DEMOTED · "..a.capKey.." · "..b.label,{})
+    end
+end
+local REQUIRED={ATTACK=2,HEAVY=1,SKILL=1,GUARD=1,DASH=1,PARRY=1}
+-- when one game action is the candidate for several capabilities (e.g. one CAS "Combat" action bound to M1 and Z),
+-- a generic animation cannot tell them apart: only capability-specific evidence may verify it then
+local SPECIFIC={SKILL={SLOT_COOLDOWN=true},GUARD={STATE_ATTR=true},PARRY={STATE_ATTR=true},DASH={DISPLACEMENT=true}}
+local function sharedBinding(capKey,b)
+    for k,st in pairs(SA.caps) do if k~=capKey then for _,c in ipairs(st.candidates) do if c.id==b.id then return true end end end end
+    for key,st in pairs(SA.skills) do if ("SKILL:"..key)~=capKey then for _,c in ipairs(st.candidates) do if c.id==b.id then return true end end end end
+    return false
+end
+local WINDOW={ATTACK=.45,HEAVY=.6,SKILL=1.0,GUARD=.4,DASH=.6,PARRY=.45}
+local function capOf(capKey) return (string.sub(capKey,1,6)=="SKILL:") and "SKILL" or capKey end
+-- explicit verification: invokes ONE candidate silently, waits for local evidence. Physical input during the test = invalid.
+local function verifyBinding(capKey,b)
+    local cap=capOf(capKey); local need=REQUIRED[cap] or 1
+    if cap=="GUARD" and b.kind=="GUI" and not (b.down and b.up) then b.lastError="NO_HOLD_SIGNAL"; return false,nil,0 end
+    local skill=b.index and {index=b.index,key=b.key} or nil
+    local specific=sharedBinding(capKey,b) and SPECIFIC[cap] or nil
+    local got,attempts,lastEv=0,0,nil
+    while got<need and attempts<need+2 and SA.testing and not RAVYN._destroyed do
+        attempts=attempts+1
+        local me=liveHumanoid(); local myHp=me and tonumber(me.Health) or nil
+        local physBefore=A.total
+        local snap=EV.snap((cap=="HEAVY") and "ATTACK" or cap,LiveAction.target,skill)
+        local ok,src=silentInvoke(b,(cap=="GUARD") and "DOWN" or "TAP")
+        B.testExecs=B.testExecs+1
+        if not ok then b.lastError=src; break end
+        local ev=nil; local deadline=os.clock()+(WINDOW[cap] or .5)
+        repeat
+            task.wait(.05)
+            local e=EV.evaluate(snap)
+            if EV.localOnly(e) then
+                if not specific then ev=e else for k in pairs(specific) do if e[k]~=nil then ev=e end end end
+            end
+        until ev or os.clock()>=deadline or not SA.testing
+        if cap=="GUARD" then silentInvoke(b,"UP") end
+        -- any other input (loot key, menu click) or a hit on you during the window makes this attempt inconclusive:
+        -- it is neither counted as evidence nor as a failure
+        local me2=liveHumanoid(); local hitMe=myHp and me2 and tonumber(me2.Health) and me2.Health<myHp-0.01
+        if A.total~=physBefore then b.lastError="INCONCLUSIVE · other input during the test window"
+        elseif hitMe then b.lastError="INCONCLUSIVE · you were hit during the test window"
+        elseif ev then got=got+1; lastEv=EV.text(ev); b.lastError=nil
+        else b.lastError=specific and "NO_SPECIFIC_EVIDENCE (shared game action)" or "NO_LOCAL_EVIDENCE" end
+        task.wait((cap=="SKILL") and .2 or .45)
+    end
+    return got>=need,lastEv,attempts
+end
+function SA.verifyAll(only)
+    if SA.testing then return result(false,"SILENT_VERIFY_RUNNING") end
+    B.releaseAll("SILENT_VERIFY")
+    SA.testing=true; SA.test={startedAt=os.clock(),step="RESOLVING",results={}}
+    task.spawn(function()
+        local ok,err=pcall(function()
+            SA.resolve("VERIFY")
+            local order={"ATTACK"}
+            local sk={}; for key,st in pairs(SA.skills) do table.insert(sk,{key=key,index=st.index or 99}) end
+            table.sort(sk,function(x,y) return x.index<y.index end)
+            for _,x in ipairs(sk) do table.insert(order,"SKILL:"..x.key) end
+            for _,c in ipairs({"GUARD","DASH","PARRY","HEAVY"}) do table.insert(order,c) end
+            for _,capKey in ipairs(order) do
+                if not SA.testing or RAVYN._destroyed then break end
+                if not only or only==capKey then
+                    local st=SA.bindingFor(capKey)
+                    if st and #st.candidates>0 then
+                        local passed=false
+                        for i,b in ipairs(st.candidates) do
+                            if i>(tonumber(scfg().MaxCandidates) or 3) or not SA.testing then break end
+                            SA.test.step=capKey.." · "..b.label
+                            local pass,ev,att=verifyBinding(capKey,b)
+                            table.insert(SA.test.results,{cap=capKey,label=b.label,pass=pass,evidence=ev,attempts=att,error=b.lastError})
+                            if pass then markVerified(capKey,st,b,ev); passed=true; break end
+                        end
+                        if not passed then
+                            if st.binding then st.binding.verified=false end
+                            st.status="PARTIAL"; st.reason="not verified · no local evidence from "..math.min(#st.candidates,tonumber(scfg().MaxCandidates) or 3).." candidate(s)"
+                            persistVerified(capKey,nil)
+                        end
+                    else
+                        table.insert(SA.test.results,{cap=capKey,label="—",pass=false,error="UNAVAILABLE · no local game action found"})
+                    end
+                end
+            end
+        end)
+        SA.test.finishedAt=os.clock(); SA.test.step=ok and "DONE" or ("ERROR · "..tostring(err))
+        SA.lastTest=SA.test; SA.testing=false
+        RAVYN.Logger:log(ok and "INFO" or "ERROR","SILENT_VERIFY · "..SA.summary(),{error=(not ok) and tostring(err) or nil})
+    end)
+    return result(true,"SILENT_VERIFY_STARTED")
+end
+function SA.clearVerified()
+    pcall(function() RAVYN:SetConfig("SilentCombat.Verified",{}) end)
+    for _,st in pairs(SA.caps) do if st.binding then st.binding.verified=false; st.status="PARTIAL"; st.reason="verification cleared" end end
+    for _,st in pairs(SA.skills) do if st.binding then st.binding.verified=false; st.status="PARTIAL"; st.reason="verification cleared" end end
+    return result(true,"SILENT_VERIFICATION_CLEARED")
+end
+function SA.GetStatus()
+    local caps={}
+    for _,c in ipairs({"ATTACK","SKILL","GUARD","DASH","PARRY"}) do local s,why=SA.capStatus(c); local st=SA.caps[c]; caps[c]={status=s,reason=why,binding=st and st.binding and st.binding.label or nil} end
+    local anyVerified=false; for _,c in pairs(caps) do if c.status=="VERIFIED_SILENT" then anyVerified=true end end
+    return {silent=anyVerified,backend="SILENT_LOCAL",status=caps.ATTACK.status,caps=caps,reason=SA.reason,gen=SA.gen,api=SA.api,testing=SA.testing}
+end
+
+-- ================= CombatActionBus =================
+local stunAt,stunVal=-math.huge,false
+function B.playerStunned()
+    local now=os.clock(); if now-stunAt<.1 then return stunVal end; stunAt=now; stunVal=false
+    local h=liveHumanoid(); if not h then stunVal=true; return true end
+    local ok,hp=pcall(function() return h.Health end); if ok and tonumber(hp) and hp<=0 then stunVal=true; return true end
+    local ok2,st=pcall(function() return h:GetState() end)
+    if ok2 and (st==Enum.HumanoidStateType.Dead or st==Enum.HumanoidStateType.Physics or st==Enum.HumanoidStateType.Ragdoll or st==Enum.HumanoidStateType.FallingDown) then stunVal=true; return true end
+    local ch=h.Parent
+    if ch then
+        for _,n in ipairs({"Stun","Stunned","Ragdoll","Ragdolled","Knocked"}) do
+            local okV,v=pcall(function() return ch:FindFirstChild(n) end)
+            if okV and v then
+                local on=true
+                pcall(function() if v:IsA("BoolValue") then on=v.Value==true elseif v:IsA("NumberValue") or v:IsA("IntValue") then on=(tonumber(v.Value) or 0)>0 end end)
+                if on then stunVal=true; return true end
+            end
+            local okA,a=pcall(function() return ch:GetAttribute(n) end)
+            if okA and (a==true or (type(a)=="number" and a>0)) then stunVal=true; return true end
+        end
+    end
+    return false
+end
+local function fightFor(target,now)
+    if not (target and target.id) then return B.fight end
+    local f=B.fight
+    if not f or f.id~=target.id then
+        if f then f.endedAt=now; B.lastFight=f end
+        f={id=target.id,name=target.name,boss=target.isBoss==true or target.classification=="BOSS",startedAt=now,mode=B.mode(),
+            requests=0,executed=0,silent=0,legacy=0,physicalCombat=0,physicalOther=0,blocked=0,rejects={}}
+        B.fight=f
+    end
+    f.lastAt=now; f.goneAt=nil
+    return f
+end
+-- rejections that describe a capability (not a transient lock/cooldown)
+local CAP_CODES={SILENT_UNAVAILABLE=true,THRESHOLD_FINISHER_SILENT_UNAVAILABLE=true,LEGACY_BLOCKED_IN_SILENT=true,GUARD_KEY_UNRESOLVED=true,
+    PARRY_KEY_UNRESOLVED=true,ACTION_FAILED=true,PLAYER_STUNNED=true,SILENT_VERIFY_RUNNING=true}
+B.CAP_CODES=CAP_CODES
+local function reject(code,kind,f,detail)
+    B.lastReject={code=code,kind=kind,at=os.clock(),detail=detail}
+    if CAP_CODES[code] then B.lastCapReject=B.lastReject end
+    B.rejects[code]=(B.rejects[code] or 0)+1
+    if f then f.rejects[code]=(f.rejects[code] or 0)+1 end
+    return result(false,code,{kind=kind,detail=detail,mode=B.mode()})
+end
+function B.backendFor(capKey,finisher)
+    local mode=B.mode()
+    if mode=="LEGACY_INPUT" then return "LEGACY_INPUT",nil end
+    local st=SA.bindingFor(capKey)
+    if st and st.status=="VERIFIED_SILENT" and st.binding then return "SILENT_LOCAL",st.binding end
+    if mode=="HYBRID" then return "LEGACY_INPUT",nil end
+    return nil,nil,finisher and "THRESHOLD_FINISHER_SILENT_UNAVAILABLE" or "SILENT_UNAVAILABLE"
+end
+local LOCK={ATTACK=.35,HEAVY=.6,SKILL=.9,FINISHER=.6,GUARD=.2,DASH=.45,PARRY=.35}
+local function lockWindow(a)
+    if a.kind=="ATTACK" then
+        local M=RAVYN.CombatMobility; local pp=(M and M.params and M.params()) or {m1=.14}
+        return math.max(.08,math.min(LOCK.ATTACK,tonumber(pp.m1) or .14))
+    end
+    if a.kind=="SKILL" then local c=RAVYN.Config.CombatMobility; return math.max(.3,math.min(LOCK.SKILL,tonumber(c and c.SkillCastLock) or .45)) end
+    return LOCK[a.kind] or .3
+end
+-- damage learning: target HP fraction between consecutive offensive dispatches (samples at death are skipped)
+local function closeDamage(now,target)
+    local p=B.pendingDmg; if not p then return end
+    B.pendingDmg=nil
+    if target and target.id~=p.targetId then return end
+    local f=EV.hpFrac(p.hum)
+    if f and f>0 and f<=p.frac and now-p.at<=1.2 then
+        local drop=p.frac-f
+        local s=B.dmg[p.key] or {ema=0,n=0,max=0}
+        s.ema=(s.n==0) and drop or (s.ema*.7+drop*.3); s.n=s.n+1; s.max=math.max(s.max,drop); s.last=drop
+        B.dmg[p.key]=s
+    end
+end
+local function noteDispatch(a,target,now)
+    local h=a.snap and a.snap.hum or EV.targetHum(target)
+    local f=a.hpFracBefore
+    if f and f>0 and target then B.pendingDmg={key=a.dmgKey,targetId=target.id,frac=f,at=now,hum=h} end
+end
+function B.predictKey(k)
+    local s=B.dmg[k]
+    if s and s.n>=2 then return s.ema,s end
+    local key=string.match(tostring(k),"^SKILL:(.+)$")
+    if key then local E=RAVYN.CombatEvolution; local st=E and E.skillStats and E.skillStats[key]; if st and (st.samples or 0)>=2 and (st.avgDamage or 0)>0 then return st.avgDamage/100,st end end
+    return nil
+end
+function B.predict(kind,key) return B.predictKey((kind=="SKILL" and key) and ("SKILL:"..key) or kind) end
+-- the largest damage this action has actually dealt (fraction of max HP)
+function B.predictMax(kind,key)
+    local k=(kind=="SKILL" and key) and ("SKILL:"..key) or kind
+    local s=B.dmg[k]; if s and s.n>=2 then return s.max end
+    if kind=="SKILL" and key then local E=RAVYN.CombatEvolution; local st=E and E.skillStats and E.skillStats[key]; if st and (st.samples or 0)>=2 and (st.best or 0)>0 then return st.best/100 end end
+    return nil
+end
+-- predicted damage of an offensive action that was dispatched but has not landed yet
+function B.inflight(target,now)
+    local p=B.pendingDmg
+    if not (p and target and p.targetId==target.id) or now-p.at>.35 then return 0 end
+    local f=EV.hpFrac(p.hum); if f and f<p.frac-1e-4 then return 0 end
+    return (B.predictKey(p.key)) or 0
+end
+local function settle(c,a,now,evidence)
+    a.doneAt=now; a.evidence=evidence; a.confirmed=evidence~=nil
+    c.current=nil; c.last=a
+    c.state=a.confirmed and "CONFIRMED" or "UNCONFIRMED"
+    c.readyAt=math.max(now,(a.execAt or now)+(a.minGap or 0))
+    if a.backend=="SILENT_LOCAL" then pcall(bindingOutcome,a,a.confirmed,evidence) end
+    B.lastAction=a
+end
+local function stepChannel(c,now)
+    if c.state=="ACTION_LOCK" and c.current then
+        local a=c.current
+        if now>=(a.nextPoll or 0) then
+            a.nextPoll=now+.05
+            local ok,ev=pcall(EV.evaluate,a.snap)
+            if ok and EV.first(ev) then settle(c,a,now,EV.text(ev)); return end
+        end
+        if now>=c.lockUntil then settle(c,a,now,nil) end
+    elseif c.state=="CONFIRMED" or c.state=="UNCONFIRMED" or c.state=="COOLDOWN" then
+        c.state=(now>=c.readyAt) and "READY" or "COOLDOWN"
+    end
+end
+function B.step(now)
+    now=now or os.clock()
+    stepChannel(CH.OFFENSE,now); stepChannel(CH.DEFENSE,now)
+    local p=B.pendingDmg; if p and now-p.at>.9 then closeDamage(now,nil) end
+end
+local function newAction(kind,target,opts,now)
+    B.seq=B.seq+1
+    return {seq=B.seq,kind=kind,target=target and target.name,targetId=target and target.id,targetRef=target,at=now,source=opts.source or "?",finisher=opts.finisher==true}
+end
+local function actionLabel(a)
+    if a.cap=="SKILL" then return (a.finisher and "FINISHER " or "").."SKILL "..tostring(a.skill and a.skill.key) end
+    if a.cap=="ATTACK" then return (a.finisher and "FINISHER " or "")..(a.heavy and "HEAVY" or "M1") end
+    if a.cap=="GUARD" then return "GUARD "..(a.enabled and "HOLD" or "RELEASE") end
+    return a.cap or a.kind
+end
+-- REQUESTED → EXECUTING → ACTION_LOCK (→ CONFIRMED/UNCONFIRMED → COOLDOWN → READY in B.step)
+local function submit(a,chan,now)
+    local c=CH[chan]
+    c.state="REQUESTED"; a.chan=chan; a.label=actionLabel(a)
+    local backend,binding,why=B.backendFor(a.capKey,a.finisher)
+    if not backend then c.state=(now>=c.readyAt) and "READY" or "COOLDOWN"; return reject(why,a.kind,B.fight,a.capKey) end
+    c.state="EXECUTING"; a.backend=backend; a.bindingRef=binding
+    a.displayLabel=(backend=="LEGACY_INPUT") and (a.finisher and "THRESHOLD_FINISHER_LEGACY_INPUT" or "LEGACY") or (a.finisher and "THRESHOLD_FINISHER_SILENT" or "SILENT")
+    a.snap=EV.snap(a.cap,a.targetRef,a.skill)
+    -- damage learning: close the previous action's window at THIS action's pre-dispatch HP
+    if a.dmgKey and a.targetRef then closeDamage(now,a.targetRef); a.hpFracBefore=EV.hpFrac(a.snap.hum) end
+    local ok,src
+    if backend=="SILENT_LOCAL" then ok,src=silentInvoke(binding,a.phase) else ok,src=LEGACY.dispatch(a) end
+    a.ok=ok; a.src=src; a.execAt=os.clock()
+    if not ok then
+        c.state="READY"; a.failed=true; B.lastAction=a
+        -- a silent binding whose button / tool / CAS action disappeared: re-resolve instead of retrying it
+        if backend=="SILENT_LOCAL" and (src=="UI_BUTTON_GONE" or src=="TOOL_GONE" or string.find(tostring(src),"^CAS_ERROR")) then SA.dirty="BINDING_GONE"; SA.dirtyAt=now end
+        return reject("ACTION_FAILED",a.kind,B.fight,tostring(src))
+    end
+    B.execCount=B.execCount+1
+    if backend=="SILENT_LOCAL" then B.silentCount=B.silentCount+1 else B.legacyCount=B.legacyCount+1 end
+    if a.finisher then B.finisherCount=B.finisherCount+1 end
+    local f=B.fight; if f then f.executed=f.executed+1; if backend=="SILENT_LOCAL" then f.silent=f.silent+1 else f.legacy=f.legacy+1 end end
+    table.insert(B.history,{seq=a.seq,label=a.label,backend=backend,at=a.execAt}); while #B.history>12 do table.remove(B.history,1) end
+    c.state="ACTION_LOCK"; c.current=a; c.lockUntil=now+lockWindow(a); a.nextPoll=now+.03
+    B.lastAction=a
+    return result(true,(backend=="SILENT_LOCAL") and "EXECUTED_SILENT" or "EXECUTED_LEGACY",
+        {seq=a.seq,backend=backend,binding=binding and binding.label or nil,src=src,label=a.displayLabel,action=a.label})
+end
+local function offenseGate(kind,target,now,opts)
+    if RAVYN._destroyed then return "BUS_DESTROYED" end
+    if SA.testing then return "SILENT_VERIFY_RUNNING" end
+    if not opts.manual and not (RAVYN.FSM and RAVYN.FSM.state=="RUNNING") then return "NOT_RUNNING" end
+    local IK=RAVYN.InstaKillAdapter
+    if not opts.finisher and IK and IK.locked then return "FINISHER_LOCK" end
+    if not target then return "NO_TARGET" end
+    if target.alive==false then return "TARGET_DEAD" end
+    local hf=EV.hpFrac(EV.targetHum(target)); if hf and hf<=0 then return "TARGET_DEAD" end
+    local root=liveRoot(); local tp=targetBasis(target)
+    if not (root and tp) then return "NO_POSITION" end
+    local d=(root.Position-tp).Magnitude
+    local p=(Hooks.activeProfile and Hooks.activeProfile()) or {}
+    local range=opts.range or ((kind=="SKILL") and math.max((p.attackDistance or 9)+10,18) or math.max((p.attackDistance or 9)+1.5,12))
+    if d>range then return "OUT_OF_RANGE" end
+    if B.playerStunned() then return "PLAYER_STUNNED" end
+    if not opts.finisher then
+        if B.guardDown then return "GUARD_HELD" end
+        if now<B.defenseUntil then return "DEFENSE_ACTIVE" end
+    end
+    local c=CH.OFFENSE
+    if c.state=="REQUESTED" or c.state=="EXECUTING" then return "PREVIOUS_ACTION_RUNNING" end
+    if c.state=="ACTION_LOCK" then return "ACTION_LOCK" end
+    return nil
+end
+local function defenseGate(now,opts)
+    if RAVYN._destroyed then return "BUS_DESTROYED" end
+    if SA.testing then return "SILENT_VERIFY_RUNNING" end
+    if not opts.manual and not (RAVYN.FSM and RAVYN.FSM.state=="RUNNING") then return "NOT_RUNNING" end
+    local IK=RAVYN.InstaKillAdapter; if IK and IK.locked then return "FINISHER_LOCK" end
+    if B.playerStunned() then return "PLAYER_STUNNED" end
+    local c=CH.DEFENSE
+    if c.state=="REQUESTED" or c.state=="EXECUTING" then return "PREVIOUS_ACTION_RUNNING" end
+    if c.state=="ACTION_LOCK" then return "ACTION_LOCK" end
+    return nil
+end
+local function findSkill(key)
+    key=string.upper(tostring(key or ""))
+    local ok,keys=pcall(currentSkillKeys)
+    for _,k in ipairs((ok and keys) or {}) do if k.key==key then return k end end
+    return nil
+end
+
+function B:RequestAttack(target,opts)
+    opts=opts or {}; local now=os.clock(); B.step(now)
+    target=target or LiveAction.target
+    local f=fightFor(target,now); if f then f.requests=f.requests+1 end
+    local heavy=opts.heavy==true; local ck=heavy and "HEAVY" or "ATTACK"
+    local gate=offenseGate(ck,target,now,opts); if gate then return reject(gate,ck,f) end
+    if now<(B.cooldown[ck] or 0) then return reject("COOLDOWN",ck,f) end
+    local a=newAction("ATTACK",target,opts,now); a.cap="ATTACK"; a.capKey=ck; a.heavy=heavy; a.phase="TAP"; a.dmgKey=ck
+    local M=RAVYN.CombatMobility; local pp=(M and M.params and M.params()) or {m1=.14}
+    a.minGap=heavy and 1.0 or math.max(.06,(tonumber(pp.m1) or .14)*.85)
+    local r=submit(a,"OFFENSE",now)
+    if r.ok then B.cooldown[ck]=now+a.minGap; noteDispatch(a,target,now) end
+    return r
+end
+function B:RequestSkill(skill,target,opts)
+    opts=opts or {}; local now=os.clock(); B.step(now)
+    target=target or LiveAction.target
+    if type(skill)=="string" then skill=findSkill(skill) end
+    local f=fightFor(target,now); if f then f.requests=f.requests+1 end
+    if type(skill)~="table" or not skill.key then return reject("UNKNOWN_SKILL","SKILL",f) end
+    local gate=offenseGate("SKILL",target,now,opts); if gate then return reject(gate,"SKILL",f,skill.key) end
+    local M=RAVYN.CombatMobility
+    if M and M.readiness then local r=M.readiness(skill.key,now); if r~="READY" and r~="LEARNING" then return reject("SKILL_NOT_READY","SKILL",f,skill.key.." "..tostring(r)) end end
+    local ck="SKILL:"..skill.key
+    if now<(B.cooldown[ck] or 0) then return reject("COOLDOWN","SKILL",f,skill.key) end
+    local a=newAction("SKILL",target,opts,now); a.cap="SKILL"; a.capKey=ck; a.skill={key=skill.key,index=skill.index}; a.phase="TAP"; a.minGap=.35; a.dmgKey=ck
+    local r=submit(a,"OFFENSE",now)
+    if r.ok then B.cooldown[ck]=now+.35; noteDispatch(a,target,now) end
+    return r
+end
+local function releaseGuardNow(why)
+    if not B.guardDown then return true,"NOT_HELD" end
+    local ok,src=true,"—"
+    if B.guardBackend=="SILENT_LOCAL" then ok,src=silentInvoke(B.guardBinding,"UP")
+    elseif B.guardBackend=="LEGACY_INPUT" then ok,src=LEGACY.release(B.guardKey) end
+    B.guardDown=false; B.guardBackend=nil; B.guardBinding=nil
+    local E=RAVYN.CombatEvolution; if E then E.guardDown=false; E.guardReleaseAt=0 end
+    B.lastGuardRelease={why=why,at=os.clock(),ok=ok,src=src}
+    return ok,src
+end
+B.releaseGuardNow=releaseGuardNow
+function B:RequestGuard(enabled,target,opts)
+    opts=opts or {}; local now=os.clock(); B.step(now)
+    if enabled~=true then
+        if not B.guardDown then return result(true,"GUARD_NOT_HELD") end
+        local ok,src=releaseGuardNow(opts.source or "REQUEST")
+        return result(ok,ok and "GUARD_RELEASED" or "GUARD_RELEASE_FAILED",{src=src})
+    end
+    local f=fightFor(target or LiveAction.target,now)
+    if B.guardDown then B.guardAt=now; return result(true,"GUARD_HELD",{backend=B.guardBackend}) end
+    local gate=defenseGate(now,opts); if gate then return reject(gate,"GUARD",f) end
+    if now<(B.cooldown.GUARD or 0) then return reject("COOLDOWN","GUARD",f) end
+    local a=newAction("GUARD",target,opts,now); a.cap="GUARD"; a.capKey="GUARD"; a.enabled=true; a.phase="DOWN"; a.minGap=.15
+    local backend=B.backendFor("GUARD")
+    if backend=="LEGACY_INPUT" then
+        local key=opts.key; if not key then pcall(function() key=(resolveGuardKey(now)) end) end
+        if not key then return reject("GUARD_KEY_UNRESOLVED","GUARD",f) end
+        a.guardKey=key
+    end
+    local r=submit(a,"DEFENSE",now)
+    if r.ok then
+        B.guardDown=true; B.guardAt=now; B.guardBackend=a.backend; B.guardBinding=a.bindingRef; B.guardKey=a.guardKey
+        B.cooldown.GUARD=now+.15
+    end
+    return r
+end
+function B:RequestDash(direction,target,opts)
+    opts=opts or {}; local now=os.clock(); B.step(now)
+    local f=fightFor(target or LiveAction.target,now)
+    local gate=defenseGate(now,opts); if gate then return reject(gate,"DASH",f) end
+    if now<(B.cooldown.DASH or 0) then return reject("COOLDOWN","DASH",f) end
+    local a=newAction("DASH",target,opts,now); a.cap="DASH"; a.capKey="DASH"; a.direction=((tonumber(direction) or 1)<0) and -1 or 1; a.phase="TAP"; a.minGap=.5
+    local r=submit(a,"DEFENSE",now)
+    if r.ok then B.cooldown.DASH=now+.5; B.defenseUntil=math.max(B.defenseUntil,now+.3) end
+    return r
+end
+function B:RequestParry(target,opts)
+    opts=opts or {}; local now=os.clock(); B.step(now)
+    local f=fightFor(target or LiveAction.target,now)
+    local gate=defenseGate(now,opts); if gate then return reject(gate,"PARRY",f) end
+    if now<(B.cooldown.PARRY or 0) then return reject("COOLDOWN","PARRY",f) end
+    local a=newAction("PARRY",target,opts,now); a.cap="PARRY"; a.capKey="PARRY"; a.phase="TAP"; a.minGap=.6
+    if B.backendFor("PARRY")=="LEGACY_INPUT" then
+        local key=opts.key; if not key then pcall(function() key=(resolveGuardKey(now)) end) end
+        if not key then return reject("PARRY_KEY_UNRESOLVED","PARRY",f) end
+        a.guardKey=key
+    end
+    local r=submit(a,"DEFENSE",now)
+    if r.ok then B.cooldown.PARRY=now+.6; B.defenseUntil=math.max(B.defenseUntil,now+.25) end
+    return r
+end
+local function finisherKey(action) return (type(action)=="table" and action.kind=="SKILL" and action.key) and ("SKILL:"..action.key) or "ATTACK" end
+-- can this finisher action be executed in the current mode? (no gates, no dispatch)
+function B:CanFinish(action)
+    local backend,binding,why=B.backendFor(finisherKey(action),true)
+    if not backend then return false,why end
+    return true,backend,binding
+end
+-- the ONLY finisher path: InstaKillAdapter → CombatActionBus:RequestFinisher → SilentActionAdapter (or labelled LEGACY)
+function B:RequestFinisher(target,action,opts)
+    opts=opts or {}; opts.finisher=true; local now=os.clock(); B.step(now)
+    target=target or LiveAction.target
+    local f=fightFor(target,now); if f then f.requests=f.requests+1 end
+    local IK=RAVYN.InstaKillAdapter
+    if not (IK and IK.locked and IK.session and IK.session.phase=="ARMED") then return reject("NO_FINISHER_SESSION","FINISHER",f) end
+    local ck=finisherKey(action)
+    local gate=offenseGate((ck=="ATTACK") and "ATTACK" or "SKILL",target,now,opts); if gate then return reject(gate,"FINISHER",f) end
+    local a=newAction("FINISHER",target,opts,now); a.cap=(ck=="ATTACK") and "ATTACK" or "SKILL"; a.capKey=ck; a.phase="TAP"; a.minGap=.3; a.dmgKey=ck
+    if ck~="ATTACK" then a.skill={key=action.key,index=action.index} end
+    local r=submit(a,"OFFENSE",now)
+    if r.ok then noteDispatch(a,target,now) end
+    return r
+end
+function B.releaseAll(why)
+    pcall(releaseGuardNow,why)
+    for _,c in pairs(CH) do c.state="READY"; c.current=nil; c.lockUntil=0; c.readyAt=0 end
+    B.pendingDmg=nil; B.defenseUntil=0
+    if B.fight then B.fight.endedAt=os.clock(); B.lastFight=B.fight; B.fight=nil end
+end
+function B.status()
+    local mode=B.mode()
+    local caps={}
+    for _,c in ipairs({"ATTACK","SKILL","GUARD","DASH","PARRY"}) do
+        local s,why=SA.capStatus(c); local st=SA.caps[c]
+        caps[c]={status=s,reason=why,binding=st and st.binding and st.binding.label or nil}
+    end
+    local f=B.fight or B.lastFight
+    return {mode=mode,caps=caps,
+        backend=(mode=="SILENT" and "SILENT_LOCAL") or (mode=="LEGACY_INPUT" and "LEGACY_INPUT") or "SILENT_LOCAL · LEGACY_INPUT per unavailable action",
+        offense=CH.OFFENSE.state,defense=CH.DEFENSE.state,current=CH.OFFENSE.current or CH.DEFENSE.current,last=B.lastAction,
+        fight=f,fightActive=B.fight~=nil,physicalCombat=f and f.physicalCombat or 0,physicalOther=f and f.physicalOther or 0,blocked=f and f.blocked or 0,
+        execCount=B.execCount,silentCount=B.silentCount,legacyCount=B.legacyCount,finisherCount=B.finisherCount,testExecs=B.testExecs,
+        lastReject=B.lastReject,testing=SA.testing,test=SA.test,lastTest=SA.lastTest,resolvedAt=SA.resolvedAt,resolveReason=SA.reason,gen=SA.gen,api=SA.api,
+        guardDown=B.guardDown,legacy=RAVYN.LegacyCombatAdapter.GetStatus(),audit={total=A.total,nonBus=A.nonBus,blocked=A.blocked}}
+end
+function B.GetStatus() return B.status() end
+
+-- anything still calling Hooks.pressMouse1 now goes through the bus (no direct mouse path is left)
+Hooks.pressMouse1=function()
+    local r=B:RequestAttack(LiveAction.target,{source="Hooks.pressMouse1"})
+    return r.ok,(r.value and r.value.backend) or r.code
+end
+
+-- ================= public API =================
+function RAVYN:SetCombatInputMode(m) return self:SetConfig("CombatInputMode",m) end
+function RAVYN:ResolveSilentBindings() return SA.resolve("MANUAL") end
+function RAVYN:VerifySilentBindings(only) return SA.verifyAll(only) end
+function RAVYN:ClearSilentVerification() return SA.clearVerified() end
+function RAVYN:GetCombatInputStatus() return B.status() end
+local baseSetConfigV122=RAVYN.SetConfig
+function RAVYN:SetConfig(path,value)
+    if path=="CombatInputMode" then
+        if not MODES[value] then return result(false,"UNKNOWN_COMBAT_INPUT_MODE") end
+        if value~=B.mode() then B.releaseAll("MODE_CHANGE") end -- release held keys with the OLD backend first
+    end
+    local r=baseSetConfigV122(self,path,value)
+    if r and r.ok and path=="CombatInputMode" then B.modeChangedAt=os.clock(); RAVYN.Logger:log("INFO","COMBAT_INPUT_MODE · "..tostring(value),{}) end
+    return r
+end
+
+-- ================= loop: state machine · re-resolve triggers · fight tracking · guard watchdog =================
+local function triggerCheck(now)
+    if SA.testing then return end
+    if SA.dirty then if now>=(SA.dirtyAt or 0) then SA.resolve(SA.dirty) end; return end
+    if now-(SA.lastTriggerCheck or 0)<1 then return end
+    SA.lastTriggerCheck=now
+    local s=currentSig(); local o=SA.sig or {}
+    local why=nil
+    if s.char~=o.char then why="CHARACTER_ADDED"
+    elseif s.tool~=o.tool then why="WEAPON_CHANGE"
+    elseif s.loadout~=o.loadout then why="LOADOUT_CHANGE"
+    elseif s.skills~="" and s.skills~=o.skills then why="SKILL_SET_CHANGE" end
+    if why then SA.resolve(why) end
+end
+local function fightWatch(now)
+    local t=LiveAction.target; local f=B.fight
+    if f and (not t or t.id~=f.id) then
+        f.goneAt=f.goneAt or now
+        if now-f.goneAt>1.5 then f.endedAt=now; B.lastFight=f; B.fight=nil end
+    end
+    local MO=RAVYN.MoveOwner
+    if t and t.id and (not B.fight or B.fight.id~=t.id) and MO and MO.current=="COMBAT_HOVER" and RAVYN.FSM and RAVYN.FSM.state=="RUNNING" then fightFor(t,now) end
+end
+SA.dirtyAt=os.clock()+1.5
+B.token=(B.token or 0)+1
+local token=B.token
+task.spawn(function()
+    while not RAVYN._destroyed and B.token==token do
+        local now=os.clock()
+        local ok,err=pcall(function()
+            B.step(now)
+            triggerCheck(now)
+            fightWatch(now)
+            if B.guardDown and now-B.guardAt>3 then releaseGuardNow("WATCHDOG") end
+        end)
+        if not ok then RAVYN.Logger:log("ERROR","COMBAT_BUS_TICK",{error=tostring(err)}) end
+        task.wait(.05)
+    end
+    pcall(B.releaseAll,"DESTROYED")
+end)
+local baseStopV122=RAVYN.Stop
+function RAVYN:Stop() B.releaseAll("STOP"); SA.testing=false; return baseStopV122(self) end
+local baseDestroyV122=RAVYN.Destroy
+function RAVYN:Destroy()
+    B.token=B.token+1; B.releaseAll("DESTROY"); SA.testing=false
+    SA.caps={}; SA.skills={}; SA.sig={}
+    return baseDestroyV122(self)
+end
+if LP then
+    table.insert(RAVYN._connections,LP.CharacterAdded:Connect(function()
+        -- the old character's GUI / tool / animator are gone: drop every binding, re-resolve once the new ones exist
+        B.releaseAll("RESPAWN"); SA.testing=false; SA.caps={}; SA.skills={}
+        SA.dirty="CHARACTER_ADDED"; SA.dirtyAt=os.clock()+1.5
+    end))
+end
+CTX["CombatActionBus"]=B
+CTX["SilentActionAdapter"]=SA
+CTX["InputAudit"]=A
+CTX["CombatEvidence"]=EV
+RAVYN.Logger:log("INFO","COMBAT_ACTION_BUS_V122_READY · mode "..B.mode())
+return true]==========]); if not ok then return end end
+do local ok=runChunk("InstaKillHardeningV122.lua",[==========[local G=(getgenv and getgenv()) or _G
+local CTX=G.__RAVYN_CTX
+local Hooks=CTX.Hooks
+local Util=CTX["Util"]
+local Config=CTX["Config"]
+local result=CTX["result"]
+local RAVYN=CTX["RAVYN"]
+local LiveAction=CTX["LiveAction"]
+local liveRoot=CTX["liveRoot"]
+local targetBasis=CTX["targetBasis"]
+local releaseGuard=CTX["releaseGuard"]
+local D=CTX["Direct11"]
+local B=CTX["CombatActionBus"]
+local A=CTX["InputAudit"]
+-- RAVYN DIRECT v1.2.2 · InstaKillAdapter · hardened verification
+--
+-- CLASS A · TRUE_ONE_HIT   : NO_VALID_PATH. trueOneHit is always false.
+-- CLASS B · THRESHOLD_99   : normal combat until the target is at ≤1% HP (Threshold stays 1%) → combat locks → exactly
+--                            ONE finisher → verify death → CreditProbe. PRE-ARM: when learned damage says the NEXT normal
+--                            action would cross 1% (or kill from above it), that action is not sent; instead ONE action
+--                            predicted to be lethal is dispatched as the finisher. The record keeps the real HP it was
+--                            armed at and the trigger (HP_THRESHOLD / PRE_ARM / DAMAGE_SHARE_99) — nothing is relabelled.
+-- Finisher path            : InstaKillAdapter → CombatActionBus:RequestFinisher → SilentActionAdapter (SILENT_LOCAL).
+--                            SILENT without a verified local action → THRESHOLD_FINISHER_SILENT_UNAVAILABLE (no lock, no
+--                            input). HYBRID may use the single legacy finisher, labelled THRESHOLD_FINISHER_LEGACY_INPUT.
+-- Verification             : UNTESTED → TESTING → PROBATION → VERIFIED (or FAILED). One kill never verifies. VERIFIED needs
+--                            6 qualifying finishers IN A ROW including ≥3 normal mobs, ≥2 different bosses and ≥1 high-HP
+--                            boss. A qualifying test = exactly 1 finisher dispatch, 0 other inputs during verify, confirmed
+--                            death AND a credit signal (KILL_AND_CREDIT). NO_KILL / KILL_ONLY / INVALID_VERIFICATION reset
+--                            the streak. AUTO stays MAX_BURST until VERIFIED. Only VERIFIED is persisted.
+local defaults={Mode="AUTO",Threshold=0.01,ArmDelay=.3,VerifyWindow=2.5,RangeWait=1.5,FinisherAction="AUTO",CreditWindow=8,
+    PreArm=true,PreArmMargin=1.15,LethalMargin=1.1,HighHpBossMinMaxHealth=10000,
+    RequiredStreak=6,RequiredNormal=3,RequiredBosses=2,RequiredHighHp=1,
+    VerificationStatus="UNTESTED",VerifiedAt=0,VerifiedBackend="",VerifiedMatrix="",
+    ThresholdVerifiedAt=0,ThresholdSuccesses=0,ThresholdFailures=0} -- last three: v1.2.1 keys, kept only to be cleared
+Config.Default.InstaKill=Util.deepCopy(defaults)
+RAVYN.Config.InstaKill=Util.deepMerge(defaults,RAVYN.Config.InstaKill or {})
+local function ic() return RAVYN.Config.InstaKill end
+local MODES={AUTO=true,THRESHOLD_99=true,MAX_BURST=true}
+local VSTATES={UNTESTED=true,TESTING=true,PROBATION=true,VERIFIED=true,FAILED=true}
+local LP=game:GetService("Players").LocalPlayer
+
+local IK={locked=false,session=nil,records={},tried={},retryAt={},phase="IDLE",engaged=nil,pending={},seenResolutions=0,
+    wenInst=nil,wenAt=-math.huge,wenFrame=nil,wenFrameAt=-math.huge,blockReason=nil}
+RAVYN.InstaKillAdapter=IK
+local V={streak={},tests={},queue={},testsRun=0,lethalSuccesses=0,creditSuccesses=0,misses=0,invalid=0,killOnly=0,
+    diedBeforeFinisher=0,notLethal=0,windowSkips=0,failedLast=false,lastResult=nil}
+IK.V=V
+
+-- ================= migration: v1.2.1 verified after ONE kill → discarded =================
+local function migrate()
+    local c=ic()
+    if not MODES[c.Mode] then c.Mode="AUTO" end
+    local th=tonumber(c.Threshold) or .01; if th>.01 then th=.01 end; if th<.001 then th=.001 end; c.Threshold=th -- THRESHOLD_99 means ≤1%
+    if (tonumber(c.ThresholdVerifiedAt) or 0)>0 or (tonumber(c.ThresholdSuccesses) or 0)>0 or (tonumber(c.ThresholdFailures) or 0)>0 then
+        c.ThresholdVerifiedAt=0; c.ThresholdSuccesses=0; c.ThresholdFailures=0
+        IK.migratedFrom121=true
+        RAVYN.Logger:log("WARN","INSTAKILL · v1.2.1 single-kill verification discarded · v1.2.2 requires the full test matrix",{})
+    end
+    if not VSTATES[c.VerificationStatus] then c.VerificationStatus="UNTESTED" end
+    if c.VerificationStatus=="TESTING" or c.VerificationStatus=="PROBATION" then c.VerificationStatus="UNTESTED" end -- session states are never persisted
+    if c.VerificationStatus=="VERIFIED" and not ((tonumber(c.VerifiedAt) or 0)>0 and tostring(c.VerifiedMatrix or "")~="") then
+        c.VerificationStatus="UNTESTED"; c.VerifiedAt=0
+    end
+end
+migrate()
+local baseLoadV122=RAVYN.LoadSettings
+function RAVYN:LoadSettings(...)
+    local r=baseLoadV122(self,...)
+    pcall(migrate)
+    return r
+end
+
+-- ================= reads (local only) =================
+local function playerGui() return LP and LP:FindFirstChildOfClass("PlayerGui") end
+local function humOf(target)
+    local RA=RAVYN.ReadAdapter; local raw=RA and RA.lastEntities and target and RA.lastEntities[target.id]
+    if not raw then return nil,nil end
+    local ok,h=pcall(function() return RA:_entityHumanoid(raw) end)
+    return (ok and h) or nil,raw
+end
+local function hpOf(h)
+    if not h then return nil end
+    local ok,hp,mx=pcall(function() return h.Health,h.MaxHealth end)
+    if ok and tonumber(hp) and tonumber(mx) and mx>0 then return hp/mx,hp,mx end
+    return nil
+end
+-- trace #001: PlayerGui.BossUi.MainHolder.CanvasGroup.<LocalPlayer>.Holder.Txt = "2,999.99 (99%)"
+local function bossDamageShare(target)
+    local pg=playerGui(); local bu=pg and pg:FindFirstChild("BossUi"); if not bu then return nil end
+    local id=bu:FindFirstChild("Identity"); id=id and id:FindFirstChild("Holder"); id=id and id:FindFirstChild("zText"); id=id and id:FindFirstChild("Txt")
+    if id and target and D.trim(id.Text)~=tostring(target.name) then return nil end
+    local t=bu:FindFirstChild("MainHolder"); t=t and t:FindFirstChild("CanvasGroup"); t=t and LP and t:FindFirstChild(LP.Name); t=t and t:FindFirstChild("Holder"); t=t and t:FindFirstChild("Txt")
+    return t and tonumber(string.match(t.Text or "","%((%d+)%%%)")) or nil
+end
+local function dataRoots()
+    local SCH=RAVYN.RuntimeSchema; if not (SCH and SCH.get) then return {} end
+    local n=SCH.get().nodes or {}; return {n.sectionRoot,n.playerData}
+end
+local function progressVals()
+    local out={}
+    for _,r in ipairs(dataRoots()) do
+        if r and r.Parent then
+            local pr=r:FindFirstChild("Progress")
+            if pr then
+                for _,k in ipairs({"kills","boss_kills","chests"}) do
+                    local v=pr:FindFirstChild(k); if v and v:IsA("ValueBase") then out[k]=tonumber(v.Value) end
+                end
+                return out
+            end
+        end
+    end
+    return out
+end
+local function wenValue(now)
+    if IK.wenInst and IK.wenInst.Parent then return tonumber(IK.wenInst.Value) end
+    if now-IK.wenAt<60 then return nil end
+    IK.wenAt=now
+    for _,r in ipairs(dataRoots()) do
+        if r and r.Parent then
+            local queue={{r,0}}; local head,n=1,0
+            while head<=#queue and n<400 do
+                local node,depth=queue[head][1],queue[head][2]; head=head+1; n=n+1
+                if node:IsA("ValueBase") and string.lower(node.Name)=="wen" then IK.wenInst=node; return tonumber(node.Value) end
+                if depth<3 then for _,c in ipairs(node:GetChildren()) do table.insert(queue,{c,depth+1}) end end
+            end
+        end
+    end
+    return nil
+end
+local function wenPopup(now)
+    if not (IK.wenFrame and IK.wenFrame.Parent) then
+        if now-IK.wenFrameAt<30 then return nil end
+        IK.wenFrameAt=now
+        local pg=playerGui(); local ok,f=pcall(function() return pg and pg:FindFirstChild("WenFrame",true) end)
+        IK.wenFrame=ok and f or nil
+        if not IK.wenFrame then return nil end
+    end
+    for i,d in ipairs(IK.wenFrame:GetDescendants()) do
+        if i>40 then break end
+        if d:IsA("TextLabel") and string.match(d.Text or "","^%+%d") then return d.Text end
+    end
+    return nil
+end
+local function counters(now)
+    local p=progressVals(); local RA=RAVYN.ReadAdapter
+    local x=RA and RA:getXP(); local l=RA and RA:getLevel()
+    return {kills=p.kills,bossKills=p.boss_kills,chests=p.chests,exp=(x and x.ok) and x.value or nil,level=(l and l.ok) and l.value or nil,wen=wenValue(now)}
+end
+local function promptShown(name)
+    local pg=playerGui(); if not pg then return false end
+    local h=pg:FindFirstChild("PromptsHolder") or pg
+    local g=h:FindFirstChild(name)
+    if not g then return false end
+    if g:IsA("LayerCollector") then return g.Enabled end
+    if g:IsA("GuiObject") then return g.Visible end
+    return true
+end
+local function isBoss(t) return t and (t.isBoss==true or t.classification=="BOSS") or false end
+
+-- ================= verification matrix =================
+local function matrix()
+    local m={normal=0,boss=0,distinct=0,highHp=0,streak=#V.streak}
+    local names={}
+    for _,t in ipairs(V.streak) do
+        if t.boss then
+            m.boss=m.boss+1
+            if not names[t.name] then names[t.name]=true; m.distinct=m.distinct+1 end
+            if t.highHp then m.highHp=m.highHp+1 end
+        else m.normal=m.normal+1 end
+    end
+    return m
+end
+local function compositionMet(m)
+    local c=ic()
+    return m.normal>=(tonumber(c.RequiredNormal) or 3) and m.distinct>=(tonumber(c.RequiredBosses) or 2) and m.highHp>=(tonumber(c.RequiredHighHp) or 1)
+end
+local function missing(m)
+    local c=ic(); local out={}
+    local n=(tonumber(c.RequiredNormal) or 3)-m.normal; if n>0 then table.insert(out,n.." normal mob"..(n==1 and "" or "s")) end
+    local b=(tonumber(c.RequiredBosses) or 2)-m.distinct; if b>0 then table.insert(out,b.." different boss"..(b==1 and "" or "es")) end
+    if (tonumber(c.RequiredHighHp) or 1)-m.highHp>0 then table.insert(out,"1 high-HP boss") end
+    local s=(tonumber(c.RequiredStreak) or 6)-m.streak; if s>0 then table.insert(out,s.." more pass"..(s==1 and "" or "es").." in a row") end
+    return out
+end
+function IK.verificationStatus()
+    local c=ic()
+    if c.VerificationStatus=="VERIFIED" and (tonumber(c.VerifiedAt) or 0)>0 then return "VERIFIED" end
+    if V.failedLast then return "FAILED" end
+    if V.testsRun==0 then return (c.VerificationStatus=="FAILED") and "FAILED" or "UNTESTED" end
+    if #V.streak>0 and compositionMet(matrix()) then return "PROBATION" end
+    return "TESTING"
+end
+local function modeBackendClass()
+    local m=B.mode()
+    return (m=="SILENT" and "SILENT_LOCAL") or (m=="LEGACY_INPUT" and "LEGACY_INPUT") or "HYBRID"
+end
+-- a verification is only reused with the kind of finisher backend it was earned with
+local function backendCompatible()
+    local cls=modeBackendClass()
+    if cls=="HYBRID" then return true end
+    return tostring(ic().VerifiedBackend or "")==cls
+end
+function IK.activeClass()
+    local m=ic().Mode
+    if m=="MAX_BURST" then return "MAX_BURST" end
+    if m=="THRESHOLD_99" then return "THRESHOLD_99" end -- explicit choice = test mode
+    if IK.verificationStatus()=="VERIFIED" and backendCompatible() then return "THRESHOLD_99" end
+    return "MAX_BURST" -- AUTO: never THRESHOLD_99 before the whole matrix passed
+end
+
+-- ================= finisher selection (learned damage from the CombatActionBus) =================
+local function range(action)
+    local p=(Hooks.activeProfile and Hooks.activeProfile()) or {}
+    if action and action.kind=="SKILL" then return math.max((p.attackDistance or 9)+10,18) end
+    return math.max((p.attackDistance or 9)+1.5,12)
+end
+local function readySkills(now)
+    local out={}
+    local M=RAVYN.CombatMobility
+    if M and M.skillKeys and M.readiness and RAVYN.Config.Combat.AutoAbilities then
+        for _,k in ipairs(M.skillKeys) do local r=M.readiness(k.key,now); if r=="READY" or r=="LEARNING" then table.insert(out,k) end end
+    end
+    return out
+end
+-- actions the bus can execute as a finisher in the current mode (SILENT: verified local action only)
+local function actionCandidates(now)
+    local want=ic().FinisherAction; local list={}
+    if want~="SKILL" then table.insert(list,{kind="M1",pred=(B.predict("ATTACK")),maxd=B.predictMax("ATTACK"),label="M1"}) end
+    if want~="M1" then for _,k in ipairs(readySkills(now)) do table.insert(list,{kind="SKILL",key=k.key,index=k.index,pred=(B.predict("SKILL",k.key)),maxd=B.predictMax("SKILL",k.key),label="SKILL "..k.key}) end end
+    local out={}
+    for _,a in ipairs(list) do local ok,backend=B:CanFinish(a); if ok then a.backend=backend; table.insert(out,a) end end
+    return out
+end
+-- exactly ONE action predicted to be lethal for hp fraction h:
+--   1) the smallest average damage that covers h × LethalMargin   (MARGIN)
+--   2) the largest average damage that still covers h              (AVERAGE)
+--   3) the largest damage this action has actually dealt ≥ h       (OBSERVED_MAX)
+local function pickLethal(h,cands)
+    local margin=tonumber(ic().LethalMargin) or 1.1
+    local confident,likely,capable=nil,nil,nil
+    for _,a in ipairs(cands) do
+        if a.pred and a.pred>=h*margin and (not confident or a.pred<confident.pred) then confident=a end
+        if a.pred and a.pred>=h and (not likely or a.pred>likely.pred) then likely=a end
+        if a.maxd and a.maxd>=h and (not capable or a.maxd>capable.maxd) then capable=a end
+    end
+    if confident then confident.confidence="MARGIN"; return confident end
+    if likely then likely.confidence="AVERAGE"; return likely end
+    if capable then capable.confidence="OBSERVED_MAX"; return capable end
+    return nil
+end
+-- the biggest damage the NEXT normal action could do (M1 or any ready skill)
+local function nextNormalDamage(now)
+    local best=(B.predict("ATTACK"))
+    if RAVYN.Config.Combat.AutoAbilities then
+        for _,k in ipairs(readySkills(now)) do local d=(B.predict("SKILL",k.key)); if d and (not best or d>best) then best=d end end
+    end
+    return best
+end
+
+-- ================= records =================
+local function pct(x) return x and string.format("%.1f%%",x*100) or "?" end
+local function describe(r)
+    local function pair(a,b) return (a~=nil and b~=nil) and (tostring(a).."→"..tostring(b)) or "?" end
+    local who=tostring(r.target or "?")..(r.boss and " ◆" or "")..(r.highHp and " HIGH-HP" or "")
+    if not r.finisher then
+        return string.format("%s · NORMAL KILL · %s · kills %s · boss %s · exp %s · chest %s · loot %s · %s",who,tostring(r.death or "no death"),
+            pair(r.before.kills,r.after and r.after.kills),pair(r.before.bossKills,r.after and r.after.bossKills),
+            (r.levelUp and "level-up") or (r.expGain and ("+"..r.expGain)) or "?",r.chestPrompt and "yes" or "no",r.lootPrompt and "yes" or "no",tostring(r.credit or "PENDING"))
+    end
+    return string.format("%s · FINISHER %s [%s] · trigger %s · HP before %s · predicted %s · dispatch %s · inputs during verify %s · death %s · kills %s · boss %s · exp %s · wen %s · chest %s · loot %s · %s",
+        who,tostring(r.action),tostring(r.backend or "?"),tostring(r.trigger or "?"),pct(r.hpBefore),pct(r.predicted),
+        tostring(r.finisherDispatchCount or "?"),tostring(r.inputsDuringVerify or "?"),tostring(r.death or "none"),
+        pair(r.before.kills,r.after and r.after.kills),pair(r.before.bossKills,r.after and r.after.bossKills),
+        (r.levelUp and "level-up") or (r.expGain and ("+"..r.expGain)) or "?",(r.wenGain and ("+"..r.wenGain)) or (r.wenPopup and tostring(r.wenPopup)) or "?",
+        r.chestPrompt and "yes" or "no",r.lootPrompt and "yes" or "no",tostring(r.classification or r.credit or "PENDING"))
+end
+IK.describe=describe
+local function creditOf(r)
+    if not r.death then return "NO_KILL" end
+    local a=r.after or {}; local b=r.before or {}
+    local killsUp=(a.kills and b.kills and a.kills>b.kills) or false
+    local bossUp=(a.bossKills and b.bossKills and a.bossKills>b.bossKills) or false
+    local expUp=r.levelUp==true or (tonumber(r.expGain) or 0)>0
+    local wenUp=(tonumber(r.wenGain) or 0)>0 or (r.wenPopup~=nil)
+    if killsUp or bossUp or expUp or wenUp or r.chestPrompt or r.lootPrompt then return "KILL_AND_CREDIT" end
+    return "KILL_ONLY"
+end
+local function pushRecord(r) table.insert(IK.records,r); while #IK.records>12 do table.remove(IK.records,1) end end
+local function persistVerified(m)
+    local seen,n,only={},0,nil
+    for _,t in ipairs(V.streak) do if not seen[t.backend or "?"] then seen[t.backend or "?"]=true; n=n+1; only=t.backend or "?" end end
+    local backend=(n==1) and only or "MIXED"
+    local summary=string.format("%d in a row · %d normal · %d boss kills (%d different) · %d high-HP · %s",m.streak,m.normal,m.boss,m.distinct,m.highHp,backend)
+    pcall(function() RAVYN:SetConfig("InstaKill.VerifiedBackend",backend) end)
+    pcall(function() RAVYN:SetConfig("InstaKill.VerifiedMatrix",summary) end)
+    pcall(function() RAVYN:SetConfig("InstaKill.VerifiedAt",os.time()) end)
+    pcall(function() RAVYN:SetConfig("InstaKill.VerificationStatus","VERIFIED") end)
+    RAVYN.Logger:log("INFO","INSTAKILL · THRESHOLD_99 VERIFIED · "..summary,{})
+    D.event("Insta Kill · THRESHOLD_99 VERIFIED · "..summary,"success")
+end
+local function demote(cls)
+    pcall(function() RAVYN:SetConfig("InstaKill.VerifiedAt",0) end)
+    pcall(function() RAVYN:SetConfig("InstaKill.VerificationStatus","FAILED") end)
+    D.event("Insta Kill · verification withdrawn (finisher "..cls..") · AUTO is MAX BURST again","warn")
+end
+-- a finished test counts in dispatch order (a later miss can never be applied before an earlier pass)
+local function applyTest(r)
+    V.testsRun=V.testsRun+1
+    local cls=r.classification
+    if cls=="KILL_AND_CREDIT" then
+        V.creditSuccesses=V.creditSuccesses+1; V.failedLast=false
+        table.insert(V.streak,{name=r.target,boss=r.boss,highHp=r.highHp,backend=r.backend})
+        r.streakAfter=#V.streak
+        local m=matrix(); local c=ic()
+        if c.VerificationStatus~="VERIFIED" and m.streak>=(tonumber(c.RequiredStreak) or 6) and compositionMet(m) then persistVerified(m) end
+    else
+        if cls=="NO_KILL" then V.misses=V.misses+1 elseif cls=="KILL_ONLY" then V.killOnly=V.killOnly+1 elseif cls=="INVALID_VERIFICATION" then V.invalid=V.invalid+1 end
+        V.streak={}; r.streakAfter=0
+        if cls=="NO_KILL" or cls=="KILL_ONLY" then
+            V.failedLast=true
+            if ic().VerificationStatus=="VERIFIED" then demote(cls) end
+        end
+    end
+    table.insert(V.tests,r); while #V.tests>20 do table.remove(V.tests,1) end
+    V.lastResult=r
+    RAVYN.Logger:log(cls=="KILL_AND_CREDIT" and "INFO" or "WARN","INSTAKILL_TEST · "..describe(r),{})
+end
+local function drainQueue()
+    while V.queue[1] and V.queue[1].ready do applyTest(table.remove(V.queue,1)) end
+end
+local function startCredit(r,now)
+    r.deathAt=now; r.credit="PENDING"
+    local LB=RAVYN.BossLootV2
+    r.lootChestsBefore=LB and LB.stats and LB.stats.chestsOpened or 0
+    r.lootItemsBefore=LB and LB.stats and LB.stats.items or 0
+    table.insert(IK.pending,r); pushRecord(r)
+end
+local function creditStep(now)
+    for i=#IK.pending,1,-1 do
+        local r=IK.pending[i]
+        r.chestPrompt=r.chestPrompt or promptShown("ChestPrompt")
+        r.lootPrompt=r.lootPrompt or promptShown("LootDropPrompt")
+        r.wenPopup=r.wenPopup or wenPopup(now)
+        if now-r.deathAt>=(ic().CreditWindow or 8) then
+            r.after=counters(now)
+            local LB=RAVYN.BossLootV2
+            if LB and LB.stats then
+                if (LB.stats.chestsOpened or 0)>r.lootChestsBefore then r.chestPrompt=true end
+                if (LB.stats.items or 0)>r.lootItemsBefore then r.lootPrompt=true end
+            end
+            if r.after.level and r.before.level and r.after.level>r.before.level then r.levelUp=true
+            elseif r.after.exp and r.before.exp then r.expGain=r.after.exp-r.before.exp end
+            if r.after.wen and r.before.wen then r.wenGain=r.after.wen-r.before.wen end
+            r.credit=creditOf(r)
+            if r.finisher then r.classification=r.classification or r.credit; r.ready=true end
+            r.text=describe(r)
+            RAVYN.Logger:log("INFO","LOOT · credit · "..r.text,{})
+            table.remove(IK.pending,i)
+        end
+    end
+    drainQueue()
+end
+
+-- ================= finisher session =================
+local function release(reason)
+    local s=IK.session
+    if s and s.conn then pcall(function() s.conn:Disconnect() end) end
+    IK.session=nil; IK.locked=false; IK.phase="IDLE"; IK.lastRelease=reason
+end
+local function lock(t,h,raw,f,mx,now,why,action,predNext,inflight)
+    IK.tried[t.id]=now
+    local boss=isBoss(t)
+    local s={id=t.id,name=t.name,boss=boss,maxHealth=mx,highHp=(boss and mx and mx>=(tonumber(ic().HighHpBossMinMaxHealth) or 10000)) or false,
+        hum=h,raw=raw,phase="ARMED",at=now,hpArmed=f,trigger=why,action=action,predictedNext=predNext,inflight=inflight,
+        share=boss and bossDamageShare(t) or nil,finAtArm=B.finisherCount}
+    if h then
+        local ok,c=pcall(function() return h.Died:Connect(function() if IK.session==s then s.died=s.died or "Humanoid.Died" end end) end)
+        if ok then s.conn=c end
+    end
+    IK.session=s; IK.locked=true; IK.phase="ARMED"
+    pcall(function() if releaseGuard then releaseGuard() end end) -- before the finisher, never during verify
+    return s
+end
+local function deathOf(s)
+    if s.died then return s.died end
+    local f,hp=hpOf(s.hum)
+    if hp and hp<=0 then return "HealthZero" end
+    if (s.raw and not s.raw.Parent) or (s.hum and not s.hum.Parent) then return "Removed" end
+    return nil
+end
+local function newRecord(s,now)
+    local a=s.action or {}
+    return {target=s.name,boss=s.boss,highHp=s.highHp,maxHealth=s.maxHealth,finisher=true,trigger=s.trigger,
+        action=(a.kind=="SKILL" and ("SKILL "..tostring(a.key))) or "M1",predicted=a.pred,predictedMax=a.maxd,confidence=a.confidence,predictedNext=s.predictedNext,inflight=s.inflight,
+        backend=s.backend,label=s.label,binding=s.binding,hpArmed=s.hpArmed,hpBefore=s.hpBefore,share=s.share,before=s.before or {},at=now,mode=B.mode()}
+end
+local function finishSession(s,now,death)
+    local r=newRecord(s,now)
+    r.finisherDispatchCount=B.finisherCount-(s.finAtArm or 0)
+    r.busActionsDuringVerify=B.execCount-(s.execAtDispatch or B.execCount)
+    r.otherInputsDuringVerify=A.nonBus-(s.nonBusAtDispatch or A.nonBus)
+    r.inputsDuringVerify=r.busActionsDuringVerify+r.otherInputsDuringVerify
+    r.physicalDuringVerify=A.total-(s.physAtDispatch or A.total)
+    r.blockedDuringVerify=A.blocked-(s.blockedAtDispatch or A.blocked)
+    r.death=death
+    local f=hpOf(s.hum); r.hpAfter=f or (death and 0) or nil
+    r.valid=r.finisherDispatchCount==1 and r.inputsDuringVerify==0 and r.physicalDuringVerify==0 and r.blockedDuringVerify==0
+    table.insert(V.queue,r)
+    if not r.valid then
+        r.classification="INVALID_VERIFICATION"; r.credit="INVALID_VERIFICATION"; r.ready=true
+        r.text=describe(r); pushRecord(r)
+    elseif death then
+        V.lethalSuccesses=V.lethalSuccesses+1
+        startCredit(r,now) -- classified after the CreditWindow
+    else
+        r.classification="NO_KILL"; r.credit="NO_KILL"; r.ready=true
+        r.text=describe(r); pushRecord(r)
+    end
+    IK.lastFinisher=r
+    if death then D.event("Insta Kill · finisher killed "..tostring(s.name).." ("..death..") · checking credit","success")
+    else D.event("Insta Kill · finisher did not kill "..tostring(s.name).." · normal combat resumes","warn") end
+    release(death and "KILLED" or "NO_KILL")
+    drainQueue()
+end
+local function sessionStep(now)
+    local s=IK.session; if not s then return end
+    if not D.running() then release("STOPPED"); return end
+    if s.phase=="ARMED" then
+        local t=LiveAction.target
+        if not t or t.id~=s.id then release("TARGET_CHANGED"); return end
+        local death=deathOf(s)
+        if death then
+            -- an action already in flight killed it: no finisher was sent → not a test (credit-probed for comparison)
+            V.diedBeforeFinisher=V.diedBeforeFinisher+1
+            local r=newRecord(s,now); r.finisher=false; r.death=death; r.note="died before the finisher"
+            r.before=(IK.engaged and IK.engaged.id==s.id and IK.engaged.before) or {}
+            startCredit(r,now); release("DIED_BEFORE_FINISHER"); return
+        end
+        if now-s.at<(ic().ArmDelay or .3) then return end
+        local f=hpOf(s.hum)
+        if s.trigger=="PRE_ARM" and f then
+            -- in-flight damage has landed: the ONE finisher must still be predicted lethal for the settled HP
+            local a=pickLethal(f,actionCandidates(now))
+            if not a then V.notLethal=V.notLethal+1; IK.tried[s.id]=nil; IK.retryAt[s.id]=now+2; release("NOT_LETHAL_AFTER_SETTLE"); return end
+            s.action=a
+        end
+        local root=liveRoot(); local tp=targetBasis(t)
+        local d=(root and tp) and (root.Position-tp).Magnitude or math.huge
+        local rng=range(s.action)
+        if d>rng then
+            if now-s.at>(ic().RangeWait or 1.5)+(ic().ArmDelay or .3) then IK.tried[s.id]=nil; IK.retryAt[s.id]=now+2; release("OUT_OF_RANGE") end
+            return
+        end
+        s.hpBefore=f or s.hpArmed
+        s.before=counters(now)
+        local physBefore=A.total
+        local r=B:RequestFinisher(t,s.action,{source="InstaKillAdapter",range=rng})
+        if not r.ok then
+            if (B.CAP_CODES and B.CAP_CODES[r.code]) or r.code=="NO_FINISHER_SESSION" then
+                IK.blockReason=r.code; IK.tried[s.id]=nil; IK.retryAt[s.id]=now+3; release("FINISHER_REFUSED:"..tostring(r.code))
+            end
+            return -- transient (ACTION_LOCK / COOLDOWN): nothing was sent, try again next tick
+        end
+        s.backend=r.value and r.value.backend; s.label=r.value and r.value.label; s.binding=r.value and r.value.binding
+        s.sentAt=now; s.phase="VERIFY"; IK.phase="VERIFY"
+        -- baselines taken AFTER the one finisher dispatch: everything counted from here on is "during verify"
+        s.execAtDispatch=B.execCount; s.physAtDispatch=A.total; s.nonBusAtDispatch=A.nonBus; s.blockedAtDispatch=A.blocked
+        s.physFinisher=A.total-physBefore
+        return
+    end
+    if s.phase=="VERIFY" then
+        local death=deathOf(s)
+        if death then finishSession(s,now,death); return end
+        if now-s.sentAt>(ic().VerifyWindow or 2.5) then finishSession(s,now,nil) end
+    end
+end
+local function armStep(now)
+    if IK.session then IK.armWhy="SESSION"; return end
+    if IK.activeClass()~="THRESHOLD_99" or not D.running() then IK.blockReason=nil; IK.armWhy="CLASS_"..IK.activeClass(); return end
+    local SA=RAVYN.SilentActionAdapter; if SA and SA.testing then IK.armWhy="SILENT_TEST"; return end
+    local t=LiveAction.target; if not (t and t.id) then IK.armWhy="NO_TARGET"; return end
+    if IK.tried[t.id] and now-IK.tried[t.id]<60 then IK.armWhy="ALREADY_TESTED_THIS_TARGET"; return end
+    if IK.retryAt[t.id] and now<IK.retryAt[t.id] then IK.armWhy="RETRY_WAIT"; return end
+    local MO=RAVYN.MoveOwner; if not (MO and MO.current=="COMBAT_HOVER") then IK.armWhy="NOT_IN_COMBAT_HOVER"; return end
+    local h,raw=humOf(t); local f,_,mx=hpOf(h)
+    if f and f<=0 then IK.armWhy="TARGET_DEAD"; return end
+    local c=ic(); local th=tonumber(c.Threshold) or .01
+    local why,predNext,inflight=nil,nil,0
+    if f then
+        if f<=th then why="HP_THRESHOLD"
+        elseif c.PreArm then
+            predNext=nextNormalDamage(now); inflight=B.inflight(t,now)
+            if predNext and (f-inflight)-predNext*(tonumber(c.PreArmMargin) or 1.15)<=th then why="PRE_ARM" end
+        end
+    elseif isBoss(t) then
+        -- real HP unreadable: the boss damage share is the fallback (never used while real HP is readable)
+        local share=bossDamageShare(t)
+        if share and share>=99 then why="DAMAGE_SHARE_99" end
+    end
+    if not why then IK.armWhy=f and string.format("WATCHING %.1f%%",f*100) or "HP_UNREADABLE"; return end
+    local cands=actionCandidates(now)
+    if #cands==0 then IK.blockReason=(B.mode()=="SILENT") and "THRESHOLD_FINISHER_SILENT_UNAVAILABLE" or "THRESHOLD_FINISHER_UNAVAILABLE"; IK.armWhy=IK.blockReason; return end
+    IK.blockReason=nil
+    local action
+    if why=="PRE_ARM" then
+        -- the next normal action would cross 1%: it is NOT sent. If one action is predicted lethal it becomes the
+        -- finisher; if none is, the next normal action is predicted to land inside the window (not kill) → allowed.
+        action=pickLethal(f,cands)
+        if not action then IK.armWhy=string.format("PRE_ARM_NO_LETHAL %.1f%%",f*100); return end
+    else
+        action=pickLethal(f or th,cands) or cands[1]
+    end
+    lock(t,h,raw,f,mx,now,why,action,predNext,inflight)
+end
+-- synchronous check from the combat executor right before every normal attack decision
+function IK.preAttack(target,now)
+    if IK.session then return IK.locked end
+    local ok=pcall(armStep,now or os.clock())
+    return ok and IK.locked or false
+end
+local function engageStep(now)
+    local t=LiveAction.target
+    if t and t.id and (not IK.engaged or IK.engaged.id~=t.id) then
+        IK.engaged={id=t.id,name=t.name,boss=isBoss(t),before=counters(now),at=now,cls=IK.activeClass()}
+    end
+    local AP=RAVYN.AutoPlay384; local Hh=AP and AP.handoff
+    if Hh and (Hh.resolutions or 0)>IK.seenResolutions then
+        IK.seenResolutions=Hh.resolutions or 0
+        local e=IK.engaged
+        local finisherOwned=(IK.session and e and IK.session.id==e.id) or (IK.lastFinisher and IK.lastFinisher.at and now-IK.lastFinisher.at<1 and IK.lastFinisher.death)
+        if e and not finisherOwned then
+            -- died from a normal action while the finisher was active and before any finisher was tried on it
+            if (e.cls=="THRESHOLD_99" or IK.activeClass()=="THRESHOLD_99") and not IK.tried[e.id] then V.windowSkips=V.windowSkips+1 end
+            startCredit({target=e.name,boss=e.boss,finisher=false,action="—",death=tostring(Hh.deathBy or "RESOLVED"),before=e.before or {},at=now},now)
+        end
+        IK.engaged=nil
+    end
+end
+
+-- ================= public API =================
+function IK.CanUse(target)
+    target=target or LiveAction.target
+    if not target then return false,"NO_TARGET" end
+    if IK.activeClass()~="THRESHOLD_99" then return false,"MODE_"..IK.activeClass() end
+    local h=humOf(target); local f=hpOf(h)
+    if not f then return false,"HP_UNREADABLE" end
+    if f<=0 then return false,"ALREADY_DEAD" end
+    if f>(tonumber(ic().Threshold) or .01) then return false,"ABOVE_THRESHOLD" end
+    if #actionCandidates(os.clock())==0 then return false,(B.mode()=="SILENT") and "THRESHOLD_FINISHER_SILENT_UNAVAILABLE" or "THRESHOLD_FINISHER_UNAVAILABLE" end
+    local root=liveRoot(); local tp=targetBasis(target)
+    if not (root and tp) or (root.Position-tp).Magnitude>range() then return false,"OUT_OF_RANGE" end
+    if IK.session then return false,"BUSY" end
+    return true,"READY"
+end
+function IK.Execute(target)
+    target=target or LiveAction.target
+    local ok,why=IK.CanUse(target); if not ok then return result(false,why) end
+    local h,raw=humOf(target); local f,_,mx=hpOf(h)
+    local cands=actionCandidates(os.clock())
+    local s=lock(target,h,raw,f,mx,os.clock(),"MANUAL",pickLethal(f,cands) or cands[1],nil,0)
+    s.at=os.clock()-(ic().ArmDelay or .3)
+    return result(true,"FINISHER_ARMED")
+end
+function IK.Verify(target)
+    local s=IK.session
+    if s and target and s.id==target.id then return result(true,s.phase,{death=deathOf(s)}) end
+    local r=IK.lastFinisher
+    return result(r~=nil,r and (r.classification or (r.death and "KILLED" or "NO_KILL")) or "NO_FINISHER",r)
+end
+local function finisherPath()
+    local ok,backend=B:CanFinish({kind="M1"})
+    local SA=RAVYN.SilentActionAdapter
+    if not ok and SA then for key,st in pairs(SA.skills or {}) do local ok2,b2=B:CanFinish({kind="SKILL",key=key}); if ok2 then ok,backend=true,b2; break end end end
+    if not ok then return false,nil,(B.mode()=="SILENT") and "THRESHOLD_FINISHER_SILENT_UNAVAILABLE" or "THRESHOLD_FINISHER_UNAVAILABLE" end
+    return true,backend,(backend=="SILENT_LOCAL") and "THRESHOLD_FINISHER_SILENT" or "THRESHOLD_FINISHER_LEGACY_INPUT"
+end
+function IK.GetStatus()
+    local c=ic(); local m=matrix(); local vs=IK.verificationStatus()
+    local req=tonumber(c.RequiredStreak) or 6
+    local okF,backend,label=finisherPath()
+    return {available=okF,mode=c.Mode,activeClass=IK.activeClass(),trueOneHit=false,trueOneHitStatus="NO_VALID_PATH",
+        thresholdFinisher=IK.activeClass()=="THRESHOLD_99",threshold=tonumber(c.Threshold) or .01,
+        verificationStatus=vs,statusText=(vs=="VERIFIED") and "THRESHOLD_99 VERIFIED" or ("THRESHOLD_99 · "..vs.." · "..m.streak.."/"..req),
+        testsRequired=req,testsPassed=V.creditSuccesses,consecutivePassed=m.streak,
+        normalMobPassed=m.normal,bossPassed=m.boss,bossDistinct=m.distinct,highHpBossPassed=m.highHp,
+        lethalSuccesses=V.lethalSuccesses,creditSuccesses=V.creditSuccesses,misses=V.misses,invalidVerifications=V.invalid,killOnly=V.killOnly,
+        testsRun=V.testsRun,diedBeforeFinisher=V.diedBeforeFinisher,windowSkips=V.windowSkips,notLethal=V.notLethal,missing=missing(m),
+        required={normal=tonumber(c.RequiredNormal) or 3,bosses=tonumber(c.RequiredBosses) or 2,highHp=tonumber(c.RequiredHighHp) or 1,streak=req,highHpMin=tonumber(c.HighHpBossMinMaxHealth) or 10000},
+        verifiedAt=c.VerifiedAt,verifiedBackend=c.VerifiedBackend,verifiedMatrix=c.VerifiedMatrix,backendCompatible=backendCompatible(),
+        finisherBackend=backend,finisherLabel=label,silent=backend=="SILENT_LOCAL",blockReason=IK.blockReason,
+        phase=IK.phase,locked=IK.locked,last=IK.lastFinisher,lastTest=V.lastResult,migratedFrom121=IK.migratedFrom121==true,
+        -- v1.2.1 field names kept for older UI code
+        thresholdStatus="THRESHOLD_99_"..vs,successes=V.creditSuccesses,failures=V.misses}
+end
+IK.GetInstaKillStatus=IK.GetStatus
+function RAVYN:GetInstaKillStatus() return IK.GetStatus() end
+function RAVYN:SetInstaKillMode(m)
+    if not MODES[m] then return result(false,"UNKNOWN_INSTAKILL_MODE") end
+    if m~="THRESHOLD_99" and IK.session and IK.session.phase=="ARMED" then release("MODE_CHANGED") end
+    return self:SetConfig("InstaKill.Mode",m)
+end
+function RAVYN:SetInstaKillHighHp(n)
+    n=tonumber(n); if not n or n<1 then return result(false,"INVALID_HIGH_HP") end
+    return self:SetConfig("InstaKill.HighHpBossMinMaxHealth",n)
+end
+function RAVYN:ResetInstaKillVerification()
+    V.streak={}; V.tests={}; V.queue={}; V.testsRun=0; V.lethalSuccesses=0; V.creditSuccesses=0; V.misses=0; V.invalid=0; V.killOnly=0
+    V.diedBeforeFinisher=0; V.notLethal=0; V.windowSkips=0; V.failedLast=false; V.lastResult=nil
+    IK.tried={}; IK.retryAt={}; IK.lastFinisher=nil
+    pcall(function() self:SetConfig("InstaKill.VerifiedAt",0) end)
+    pcall(function() self:SetConfig("InstaKill.VerifiedMatrix","") end)
+    pcall(function() self:SetConfig("InstaKill.VerifiedBackend","") end)
+    return self:SetConfig("InstaKill.VerificationStatus","UNTESTED")
+end
+
+IK.token=(IK.token or 0)+1
+local token=IK.token
+task.spawn(function()
+    while not RAVYN._destroyed and IK.token==token do
+        local now=os.clock()
+        local ok,err=pcall(function() engageStep(now); sessionStep(now); armStep(now); creditStep(now) end)
+        if not ok then RAVYN.Logger:log("ERROR","INSTAKILL_TICK",{error=tostring(err)}); release("ERROR") end
+        task.wait((IK.session or #IK.pending>0) and .05 or .15)
+    end
+    release("DESTROYED")
+end)
+local baseStop=RAVYN.Stop
+function RAVYN:Stop() release("STOP"); IK.engaged=nil; return baseStop(self) end
+local baseDestroy=RAVYN.Destroy
+function RAVYN:Destroy() IK.token=IK.token+1; release("DESTROY"); IK.pending={}; V.queue={}; return baseDestroy(self) end
+if LP then table.insert(RAVYN._connections,LP.CharacterAdded:Connect(function() release("RESPAWN"); IK.engaged=nil end)) end
+CTX["InstaKill122"]=IK
+RAVYN.Logger:log("INFO","INSTAKILL_ADAPTER_V122_READY")
+return true]==========]); if not ok then return end end
+
 do local ok=runChunk("UI384_Core.lua",[==========[local G=(getgenv and getgenv()) or _G
 local CTX=G.__RAVYN_CTX
 local RAVYN=CTX["RAVYN"]
@@ -8162,6 +13413,7 @@ local result=CTX["result"]
 -- RAVYN UI v3.8.4 · state-aware premium console.
 -- Presentation only: reads a normalized UIState snapshot, calls public RAVYN:* setters. Never drives automation.
 if type(RAVYN.Config.UI.ReducedMotion)~="boolean" then RAVYN.Config.UI.ReducedMotion=false end
+RAVYN.Config.UI.DeveloperMode=false -- DIRECT release: dev/research stays hidden unless deliberately re-enabled in Settings
 local U={pages={},navButtons={},badges={},refreshers={},toggles={},C=nil,S=nil,hidden=false}
 local TweenService=game:GetService("TweenService")
 local UIS=game:GetService("UserInputService")
@@ -8179,7 +13431,15 @@ function U.dimOf(c) return U.dim[c] or C.raised end
 U.F={bold=Enum.Font.GothamBold,semi=Enum.Font.GothamMedium,body=Enum.Font.Gotham,mono=Enum.Font.Code}
 
 -- ---------------- primitives ----------------
-function U.n(class,parent,props) local x=Instance.new(class); for k,v in pairs(props or {}) do x[k]=v end; x.Parent=parent; return x end
+U.FontScale=1.34
+function U.n(class,parent,props)
+    local x=Instance.new(class)
+    for k,v in pairs(props or {}) do x[k]=v end
+    if (class=="TextLabel" or class=="TextButton" or class=="TextBox") and props and type(props.TextSize)=="number" then
+        x.TextSize=math.floor(props.TextSize*(U.FontScale or 1)+.5)
+    end
+    x.Parent=parent; return x
+end
 function U.round(x,r) U.n("UICorner",x,{CornerRadius=UDim.new(0,r or 12)}) end
 function U.stroke(x,c,t,tr) return U.n("UIStroke",x,{Color=c or C.line,Thickness=t or 1,Transparency=tr or .25,ApplyStrokeMode=Enum.ApplyStrokeMode.Border}) end
 function U.pad(x,l,r,t,b) U.n("UIPadding",x,{PaddingLeft=UDim.new(0,l or 0),PaddingRight=UDim.new(0,r or l or 0),PaddingTop=UDim.new(0,t or 0),PaddingBottom=UDim.new(0,b or t or 0)}) end
@@ -8223,6 +13483,38 @@ function U.setSize(obj,size,dur)
     local k=tostring(size); if lastVal[obj].Size==k then return end
     lastVal[obj].Size=k; U.anim(obj,dur or .24,{Size=size})
 end
+-- DIRECT v1 motion language: springy hover/press feedback with no per-frame animation loops.
+function U.pressable(obj,opts)
+    if not obj or not obj:IsA("GuiButton") then return obj end
+    opts=opts or {}
+    local sc=obj:FindFirstChild("RAVYN_MotionScale") or U.n("UIScale",obj,{Name="RAVYN_MotionScale",Scale=1})
+    local hoverScale=opts.hoverScale or 1.018
+    local pressScale=opts.pressScale or .965
+    local enterColor=opts.enterColor
+    local leaveColor=opts.leaveColor
+    table.insert(RAVYN._connections,obj.MouseEnter:Connect(function()
+        U.anim(sc,.18,{Scale=hoverScale},Enum.EasingStyle.Quint,Enum.EasingDirection.Out)
+        if enterColor then U.anim(obj,.14,{BackgroundColor3=enterColor}) end
+    end))
+    table.insert(RAVYN._connections,obj.MouseLeave:Connect(function()
+        U.anim(sc,.22,{Scale=1},Enum.EasingStyle.Quint,Enum.EasingDirection.Out)
+        if leaveColor then U.anim(obj,.18,{BackgroundColor3=leaveColor}) end
+    end))
+    table.insert(RAVYN._connections,obj.MouseButton1Down:Connect(function()
+        U.anim(sc,.085,{Scale=pressScale},Enum.EasingStyle.Quint,Enum.EasingDirection.Out)
+    end))
+    table.insert(RAVYN._connections,obj.MouseButton1Up:Connect(function()
+        U.anim(sc,.26,{Scale=hoverScale},Enum.EasingStyle.Back,Enum.EasingDirection.Out)
+    end))
+    return obj
+end
+function U.reveal(obj,offset)
+    if not obj then return end
+    local sc=obj:FindFirstChild("RAVYN_PageScale") or U.n("UIScale",obj,{Name="RAVYN_PageScale",Scale=.985})
+    sc.Scale=.985; obj.Position=UDim2.fromOffset(offset or 18,0)
+    U.anim(obj,.28,{Position=UDim2.fromOffset(0,0)},Enum.EasingStyle.Quint,Enum.EasingDirection.Out)
+    U.anim(sc,.34,{Scale=1},Enum.EasingStyle.Back,Enum.EasingDirection.Out)
+end
 
 -- ---------------- human-readable diagnostics ----------------
 U.MSG={
@@ -8237,7 +13529,8 @@ U.MSG={
     SKILL_ERROR={"Skill error","The skill call raised an error; see Diagnostics.","red"},
     OK={"Firing","Last skill input was sent.","green"},
     IDLE={"Idle","No combat yet.","gray"},
-    QUEST_TARGET_UNRESOLVED={"Quest target unknown","RAVYN is observing nearby kills to learn the objective target.","gold"},
+    QUEST_TARGET_UNRESOLVED={"Quest target unknown","RAVYN is looking for runtime evidence such as a quest marker. Random kill learning is disabled unless explicitly enabled.","gold"},
+    RESEARCH_REQUIRED={"Research required","This system's runtime behaviour is not mapped yet. Record it in Research → Learn action first.","orange"},
     QUEST_SOURCE_NOT_FOUND={"No quest source","No Crow, Muzan or quest prompt is streamed or remembered yet.","orange"},
     QUEST_SOURCE_OUT_OF_STREAM={"Source out of stream","Traveling to the last observed position.","cyan"},
     QUEST_ACCEPT_UNVERIFIED={"Accept not verified","The quest text did not change after interaction. Backing off.","orange"},
@@ -8271,6 +13564,30 @@ function U.explain(code)
     if not m and type(code)=="string" and string.find(code,"^OBJECTIVE_") then m={"Objective needs binding","This objective type has no verified action yet.","gray"} end
     if not m then return {title=tostring(code),detail="",color=C.orange,code=code} end
     return {title=m[1],detail=m[2],color=C[m[3]] or C.orange,code=code}
+end
+-- v3.9 Developer Mode: technical UI is registered once at build time and only shown in developer mode.
+-- Visibility changes only on the user's toggle (never from telemetry).
+U.devItems={}
+function U.devOnly(inst) if inst then table.insert(U.devItems,inst); inst.Visible=RAVYN.Config.UI.DeveloperMode==true end; return inst end
+function U.devRow(valueLabel) return U.devOnly(valueLabel and valueLabel.Parent) end
+function U.applyDevMode()
+    local on=RAVYN.Config.UI.DeveloperMode==true
+    for _,x in ipairs(U.devItems) do if x and x.Parent then x.Visible=on end end
+    if U.onDevModeChanged then pcall(U.onDevModeChanged,on) end
+end
+-- plain wording for capability states in simple mode
+function U.plainCap(s) return (s=="VERIFIED" and "Ready") or (s=="RESEARCH_REQUIRED" and "Needs research") or (s=="UNRESOLVED" and "Not available yet") or "Being tested" end
+-- capability colours (single vocabulary from GameKnowledge)
+function U.capColor(s)
+    return (s=="VERIFIED" and C.green) or (s=="PARTIAL" and C.orange) or (s=="AWAITING_LIVE" and C.cyan)
+        or (s=="RESEARCH_REQUIRED" and C.purple) or (s=="DISABLED" and C.gray) or C.faint
+end
+function U.capRow(parent,key)
+    return U.kv(parent,(RAVYN.GameKnowledge and RAVYN.GameKnowledge.capabilities[key] and RAVYN.GameKnowledge.capabilities[key].title) or key,function()
+        local GK=RAVYN.GameKnowledge; local c=GK and GK.capability(key)
+        if not c then return "UNRESOLVED",C.faint end
+        return GK.statusLabel(c.status),U.capColor(c.status)
+    end)
 end
 CTX["UI384"]=U
 return true]==========]); if not ok then return end end
@@ -8327,6 +13644,46 @@ function U.buildState()
     local err=RAVYN.Features and RAVYN.Features.lastError
     if err~=errState.last then errState.last=err; if err then errState.at=now end end
     S.errorRecent=err~=nil and now-errState.at<6; S.error=err
+    -- v3.9 simple language (no engineering terms for normal users)
+    local GO=RAVYN.GoState; S.dev=RAVYN.Config.UI.DeveloperMode==true
+    S.go={active=GO and GO.active or false,paused=GO and GO.paused or false,goal=(GO and GO.goal) or (RAVYN.Config.Go and RAVYN.Config.Go.Goal) or "AUTO_PROGRESS",
+        state=GO and GO.state() or "READY"}
+    S.goalTitle=(GO and GO.goals[S.go.goal] and GO.goals[S.go.goal].title) or "Auto Progress"
+    if now-(U.levelAt or -math.huge)>2 then
+        U.levelAt=now; local RA=RAVYN.ReadAdapter; local l=RA and RA:getLevel(); U.levelCache=(l and l.ok) and l.value or nil
+    end
+    S.level=U.levelCache
+    local tName=S.target and S.target.name
+    local plain
+    if S.fsm~="RUNNING" then plain=(S.go.paused or S.fsm=="PAUSED") and "Paused" or "Ready"
+    elseif S.overlay=="EMERGENCY" or (S.recovery and S.recovery~="STANDBY") then plain="Recovering"
+    elseif S.overlay=="DEFENSE" then plain="Defending"
+    elseif S.loot.active then plain="Looting"
+    elseif S.quest.nav and S.quest.phase=="TURN_IN" then plain="Turning in quest"
+    elseif S.quest.nav and S.quest.phase=="INVESTIGATE" then plain="Finding quest target"
+    elseif S.quest.nav then plain="Going to quest"
+    elseif S.owner=="TRAVEL" and tName then plain="Moving to "..tName
+    elseif tName then plain="Fighting "..tName
+    elseif S.quest.fail=="QUEST_TARGET_NEEDS_EVIDENCE" then plain="Needs research"
+    else plain="Finding target" end
+    S.plain=plain
+    local qActive=S.quest.phase=="ACTIVE" or S.quest.phase=="INVESTIGATE"
+    if qActive and S.quest.target then S.headline="Quest · Defeat "..S.quest.target
+    elseif qActive then S.headline="Quest · "..tostring(S.quest.objective)
+    elseif S.target and S.target.boss then S.headline="Boss · "..tName
+    elseif S.loot.active and S.loot.boss then S.headline="Loot · "..S.loot.boss
+    else S.headline=S.goalTitle end
+    if S.loot.active then S.next=S.loot.chestExpected and "Open chest → Collect → Continue" or "Collect → Continue"
+    elseif qActive and S.quest.progress and S.quest.required and S.quest.progress>=S.quest.required then S.next="Turn in → Next quest"
+    elseif qActive then S.next="Fight → Loot → Continue quest"
+    elseif S.target and S.target.boss then S.next="Defeat → Chest → Next boss"
+    elseif S.target then S.next="Defeat → Next target"
+    elseif S.owner=="TRAVEL" then S.next="Arrive → Fight"
+    else S.next="Looking for the next objective" end
+    if S.quest.progress then S.progressText=string.format("%d / %d",S.quest.progress,S.quest.required or 0)
+    elseif S.loot.active then S.progressText=string.format("Items %d / %d",S.loot.collected,S.loot.detected)
+    elseif S.target and S.target.hpPct then S.progressText=string.format("Target %d%%",math.floor(S.target.hpPct+.5))
+    else S.progressText="—" end
     -- semantic debounce (display only): brief flips such as COMBAT_HOVER↔DEFENSE on a dodge or
     -- M1_CHAIN↔SKILL_CAST must not repaint chips; recovery/emergency always shows immediately
     local urgentCombat=S.combatState=="RECOVERY" or S.combatState=="IDLE"
@@ -8450,12 +13807,13 @@ function U.toast(text,kind,long)
     local color=(kind=="success" and C.green) or (kind=="warn" and C.orange) or (kind=="error" and C.red) or C.cyan
     local kids=0; for _,x in ipairs(U.toastHost:GetChildren()) do if x:IsA("CanvasGroup") then kids=kids+1 end end
     if kids>=3 then for _,x in ipairs(U.toastHost:GetChildren()) do if x:IsA("CanvasGroup") then x:Destroy(); break end end end
-    local t=U.n("CanvasGroup",U.toastHost,{Size=UDim2.new(1,0,0,38),BackgroundColor3=C.raised,GroupTransparency=1,BorderSizePixel=0,LayoutOrder=math.floor(now*100)})
-    U.round(t,12); U.stroke(t,color,1,.55)
+    local t=U.n("CanvasGroup",U.toastHost,{Size=UDim2.new(1,0,0,44),BackgroundColor3=C.raised,GroupTransparency=1,BorderSizePixel=0,LayoutOrder=math.floor(now*100)})
+    U.round(t,14); U.stroke(t,color,1,.55)
+    local ts=U.n("UIScale",t,{Scale=.94})
     U.n("Frame",t,{Size=UDim2.new(0,3,1,-14),Position=UDim2.fromOffset(8,7),BackgroundColor3=color,BorderSizePixel=0})
     U.label(t,text,12,C.text,U.F.semi,{Size=UDim2.new(1,-28,1,0),Position=UDim2.fromOffset(20,0),TextTruncate=Enum.TextTruncate.AtEnd,TextWrapped=false})
-    U.anim(t,.2,{GroupTransparency=0})
-    task.delay(long and 5 or 2.6,function() if t.Parent then U.anim(t,.25,{GroupTransparency=1}); task.delay(.26,function() if t.Parent then t:Destroy() end end) end end)
+    U.anim(t,.2,{GroupTransparency=0}); U.anim(ts,.32,{Scale=1},Enum.EasingStyle.Back,Enum.EasingDirection.Out)
+    task.delay(long and 5 or 2.8,function() if t.Parent then U.anim(t,.25,{GroupTransparency=1}); U.anim(ts,.2,{Scale=.96}); task.delay(.26,function() if t.Parent then t:Destroy() end end) end end)
 end
 function U.report(r,okText)
     if type(r)~="table" then U.toast(okText or "Done","success"); return end
@@ -8535,10 +13893,9 @@ end
 function U.button(parent,text,fn,style)
     local col=(style=="accent" and C.goldDim) or (style=="danger" and C.redDim) or C.card
     local tc=(style=="accent" and C.gold) or (style=="danger" and C.red) or C.text
-    local b=U.n("TextButton",parent,{Size=UDim2.new(1,0,0,36),BackgroundColor3=col,Text=text,TextColor3=tc,TextSize=13,Font=U.F.semi,AutoButtonColor=false,BorderSizePixel=0}); U.round(b,10)
+    local b=U.n("TextButton",parent,{Size=UDim2.new(1,0,0,42),BackgroundColor3=col,Text=text,TextColor3=tc,TextSize=13,Font=U.F.semi,AutoButtonColor=false,BorderSizePixel=0}); U.round(b,12)
     local hover=(style=="accent" and Color3.fromRGB(84,70,32)) or (style=="danger" and Color3.fromRGB(84,26,28)) or C.raised
-    table.insert(RAVYN._connections,b.MouseEnter:Connect(function() U.anim(b,.12,{BackgroundColor3=hover}) end))
-    table.insert(RAVYN._connections,b.MouseLeave:Connect(function() U.anim(b,.16,{BackgroundColor3=col}) end))
+    U.pressable(b,{enterColor=hover,leaveColor=col,hoverScale=1.012,pressScale=.972})
     table.insert(RAVYN._connections,b.Activated:Connect(function()
         local ok,r=pcall(fn,b); if not ok then U.toast(tostring(r),"error") elseif r~=false then U.report(r,text) end
     end))
@@ -8552,7 +13909,7 @@ function U.warning(parent,fn)
     local c=U.label(box,"",10,C.faint,U.F.mono,{Size=UDim2.new(1,0,0,14)})
     U.addRefresh(function(S)
         local e=U.explain(fn(S)); box.Visible=e~=nil
-        if e then U.setText(t,e.title); U.setColor(t,"TextColor3",e.color); U.setText(d,e.detail); U.setText(c,e.code) end
+        if e then U.setText(t,e.title); U.setColor(t,"TextColor3",e.color); U.setText(d,e.detail); U.setText(c,e.code); c.Visible=RAVYN.Config.UI.DeveloperMode==true end
     end)
     return box
 end
@@ -8566,136 +13923,98 @@ local U=CTX["UI384"]
 local C=U.C
 local function cfg() return RAVYN.Config end
 
--- ================= HOME =================
+-- ================= HOME (v3.9 simple core: one goal · one button · one status) =================
 function U.buildHome(page)
-    -- hero
-    local hero=U.n("Frame",page,{Size=UDim2.new(1,-4,0,86),BackgroundColor3=C.panel,BorderSizePixel=0,LayoutOrder=1}); U.round(hero,16); U.stroke(hero,C.line,1,.3)
-    local accent=U.n("Frame",hero,{Size=UDim2.new(0,4,1,-28),Position=UDim2.fromOffset(14,14),BackgroundColor3=C.gray,BorderSizePixel=0}); U.round(accent,2)
-    local state=U.label(hero,"READY",22,C.text,U.F.bold,{Size=UDim2.new(1,-220,0,30),Position=UDim2.fromOffset(30,14),TextWrapped=false,TextTruncate=Enum.TextTruncate.AtEnd})
-    local sub=U.label(hero,"",12,C.sub,U.F.body,{Size=UDim2.new(1,-220,0,18),Position=UDim2.fromOffset(30,48),TextWrapped=false,TextTruncate=Enum.TextTruncate.AtEnd})
-    local master=U.n("TextButton",hero,{Size=UDim2.fromOffset(168,44),Position=UDim2.new(1,-184,.5,-22),BackgroundColor3=C.raised,Text="",AutoButtonColor=false,BorderSizePixel=0}); U.round(master,22)
-    local mStroke=U.stroke(master,C.gold,1,.6)
-    local mDot=U.n("Frame",master,{Size=UDim2.fromOffset(10,10),Position=UDim2.new(0,18,.5,-5),BackgroundColor3=C.gray,BorderSizePixel=0}); U.round(mDot,5)
-    local mText=U.label(master,"AUTO PLAY",13,C.text,U.F.bold,{Size=UDim2.new(1,-40,1,0),Position=UDim2.fromOffset(36,0),TextWrapped=false})
-    local pending=false
-    table.insert(RAVYN._connections,master.Activated:Connect(function()
-        if pending then return end; pending=true
-        local want=not (cfg().Intelligence.AutoPlay==true)
-        U.setText(mText,want and "ACTIVATING…" or "STOPPING…")
-        local ok,r=pcall(function() return RAVYN:SetAutoPlay(want) end)
-        if not ok then U.toast(tostring(r),"error") else U.report(r,want and "Auto Play active" or "Auto Play off") end
-        task.delay(.3,function() pending=false end)
-    end))
-    U.addRefresh(function(S)
-        U.setText(state,S.global); U.setColor(state,"TextColor3",S.globalColor); U.setColor(accent,"BackgroundColor3",S.globalColor)
-        U.setText(sub,"RAVYN "..S.version.."  ·  runtime "..S.fsm.."  ·  job "..S.job..(S.overlay and ("  ·  "..S.overlay) or ""))
-        if not pending then U.setText(mText,S.autoplay and "AUTO PLAY ON" or "AUTO PLAY OFF") end
-        U.setColor(mDot,"BackgroundColor3",S.autoplay and C.green or C.gray); U.setColor(master,"BackgroundColor3",S.autoplay and C.greenDim or C.raised)
-        U.setColor(mStroke,"Color",S.autoplay and C.green or C.gold)
-    end)
-    -- pipeline
-    local pipe=U.n("Frame",page,{Size=UDim2.new(1,-4,0,40),BackgroundTransparency=1,LayoutOrder=2}); U.list(pipe,6,Enum.FillDirection.Horizontal).VerticalAlignment=Enum.VerticalAlignment.Center
-    local slots={}
-    for i=1,5 do
-        local chip=U.n("Frame",pipe,{Size=UDim2.new(.2,-8,0,32),BackgroundColor3=C.card,BorderSizePixel=0,LayoutOrder=i}); U.round(chip,10)
-        local st=U.stroke(chip,C.gold,1,1)
-        local l=U.label(chip,"",11,C.faint,U.F.bold,{Size=UDim2.fromScale(1,1),TextXAlignment=Enum.TextXAlignment.Center,TextWrapped=false})
-        slots[i]={chip=chip,l=l,st=st}
+    local GO=RAVYN.GoState
+    -- hero: title, goal, big button
+    local hero=U.n("Frame",page,{Size=UDim2.new(1,-4,0,0),AutomaticSize=Enum.AutomaticSize.Y,BackgroundColor3=C.panel,BorderSizePixel=0,LayoutOrder=1})
+    U.round(hero,18); U.stroke(hero,C.gold,1,.68); U.pad(hero,24,24,22,22); U.list(hero,12)
+    -- brand row: RAVYN + version on same line
+    local brandRow=U.n("Frame",hero,{Size=UDim2.new(1,0,0,22),BackgroundTransparency=1})
+    U.label(brandRow,"RAVYN",15,C.gold,U.F.bold,{Size=UDim2.fromOffset(72,22),TextWrapped=false})
+    U.label(brandRow,"Direct v1.2.2",11,C.faint,U.F.body,{Size=UDim2.new(1,-80,1,0),Position=UDim2.fromOffset(78,0),TextWrapped=false,TextXAlignment=Enum.TextXAlignment.Left})
+    local goalL=U.label(hero,"AUTO PROGRESS",30,C.text,U.F.bold,{Size=UDim2.new(1,0,0,34),TextWrapped=false})
+    -- status pill row
+    local sRow=U.n("Frame",hero,{Size=UDim2.new(1,0,0,26),BackgroundTransparency=1})
+    local sBadge=U.n("Frame",sRow,{Size=UDim2.fromOffset(0,24),AutomaticSize=Enum.AutomaticSize.X,BackgroundColor3=C.raised,BorderSizePixel=0}); U.round(sBadge,12); U.pad(sBadge,10,10,0,0)
+    local sDot=U.n("Frame",sBadge,{Size=UDim2.fromOffset(7,7),Position=UDim2.new(0,0,.5,-3.5),BackgroundColor3=C.gray,BorderSizePixel=0}); U.round(sDot,4)
+    local stateL=U.label(sBadge,"IDLE",12,C.sub,U.F.bold,{Size=UDim2.fromOffset(80,24),Position=UDim2.fromOffset(16,0),TextWrapped=false})
+    -- goal picker (unavailable goals are dimmed and explain why)
+    local grid=U.n("Frame",hero,{Size=UDim2.new(1,0,0,0),AutomaticSize=Enum.AutomaticSize.Y,BackgroundTransparency=1})
+    U.n("UIGridLayout",grid,{CellSize=UDim2.new(.333,-6,0,32),CellPadding=UDim2.fromOffset(6,6),SortOrder=Enum.SortOrder.LayoutOrder})
+    local goalBtns={}
+    for i,key in ipairs(GO and GO.order or {}) do
+        local g=GO.goals[key]
+        local b=U.n("TextButton",grid,{BackgroundColor3=C.card,Text=g.title,TextColor3=C.sub,TextSize=12,Font=U.F.semi,AutoButtonColor=false,BorderSizePixel=0,LayoutOrder=i})
+        U.round(b,10); U.pressable(b,{hoverScale=1.02,pressScale=.96}); goalBtns[key]=b
+        table.insert(RAVYN._connections,b.Activated:Connect(function()
+            local ok=GO.available(key)
+            if not ok then U.toast(g.title.." needs research first","warn"); return end
+            local r=RAVYN:GoSetGoal(key); if r and not r.ok then U.report(r) end
+        end))
     end
-    local lastStage=nil
-    U.addRefresh(function(S)
-        local cur=0; for i,name in ipairs(S.stages) do if name==S.stage then cur=i end end
-        for i,s in ipairs(slots) do
-            local name=S.stages[i]; s.chip.Visible=name~=nil
-            if name then
-                s.chip.Size=UDim2.new(1/#S.stages,-8,0,32)
-                U.setText(s.l,(i<cur and "✓ " or "")..name)
-                local col=(i==cur and C.gold) or (i<cur and C.green) or C.faint
-                U.setColor(s.l,"TextColor3",col); U.setColor(s.chip,"BackgroundColor3",i==cur and C.goldDim or C.card)
-                U.setColor(s.st,"Transparency",i==cur and .55 or 1,.25) -- cached: tweens only when the stage changes
-            end
-        end
-        lastStage=S.stage
-    end)
-    -- telemetry tiles
-    local grid=U.n("Frame",page,{Size=UDim2.new(1,-4,0,0),AutomaticSize=Enum.AutomaticSize.Y,BackgroundTransparency=1,LayoutOrder=3})
-    U.n("UIGridLayout",grid,{CellSize=UDim2.new(.5,-5,0,72),CellPadding=UDim2.fromOffset(10,10),SortOrder=Enum.SortOrder.LayoutOrder})
-    local function tile(order,key,fn)
-        local t=U.n("Frame",grid,{BackgroundColor3=C.panel,BorderSizePixel=0,LayoutOrder=order}); U.round(t,14); U.stroke(t,C.line,1,.35)
-        local bar=U.n("Frame",t,{Size=UDim2.new(0,3,1,-24),Position=UDim2.fromOffset(12,12),BackgroundColor3=C.gray,BorderSizePixel=0}); U.round(bar,2)
-        U.label(t,key,11,C.sub,U.F.semi,{Size=UDim2.new(1,-34,0,16),Position=UDim2.fromOffset(24,10),TextWrapped=false})
-        local v=U.label(t,"—",15,C.text,U.F.bold,{Size=UDim2.new(1,-34,0,20),Position=UDim2.fromOffset(24,27),TextWrapped=false,TextTruncate=Enum.TextTruncate.AtEnd})
-        local d=U.label(t,"",11,C.sub,U.F.body,{Size=UDim2.new(1,-34,0,16),Position=UDim2.fromOffset(24,48),TextWrapped=false,TextTruncate=Enum.TextTruncate.AtEnd})
-        U.addRefresh(function(S)
-            -- metrics (counts, HP, distance) are plain text updates; only the semantic colour may tween (cached)
-            local value,detail,color=fn(S); color=color or C.gray
-            U.setText(v,value); U.setText(d,detail or ""); U.setColor(bar,"BackgroundColor3",color); U.setColor(v,"TextColor3",color==C.gray and C.text or color)
-        end)
-    end
-    tile(1,"Activity",function(S) return S.activity,S.jobLabel~="" and S.jobLabel or ("job "..S.job),S.globalColor end)
-    tile(2,"Target",function(S)
-        if not S.target then return "No target",S.eligibleBosses>0 and (S.eligibleBosses.." eligible boss(es)") or "scanning",C.gray end
-        local hp=S.target.hpPct and string.format("%d%% HP",math.floor(S.target.hpPct+.5)) or "HP ?"
-        return (S.target.boss and "◆ " or "")..S.target.name,hp.."  ·  "..U.fmtDist(S.target.dist),S.target.boss and C.gold or C.green end)
-    tile(3,"Quest",function(S)
-        if not S.questEnabled then return "Off","enable in Quests",C.gray end
-        local q=S.quest; local prog=q.progress and string.format("%d / %d",q.progress,q.required or 0) or ""
-        return q.state,q.source.."  ·  "..(q.target or (q.objective=="KILL" and "learning target…" or q.objective)).."  "..prog,(q.fail and q.fail~="QUEST_TARGET_UNRESOLVED") and C.orange or C.purple end)
-    tile(4,"Movement",function(S)
-        local label=(S.owner=="COMBAT_HOVER" and "Combat Hover") or (S.owner=="TRAVEL" and "Travel") or (S.owner=="DEFENSE" and "Defense") or (S.owner=="RECOVERY" and "Recovery") or "Idle"
-        local det=(S.owner=="TRAVEL" and S.travelMode) or (S.owner=="COMBAT_HOVER" and S.hover) or S.moveReason
-        return label,det..(S.noclip and "  ·  noclip" or ""),U.ownerColor(S.owner) end)
-    tile(5,"Combat",function(S)
-        local e=U.explain(S.skillFail)
-        local combo=S.combo>0 and ("M1 ×"..S.combo) or "—"
-        if S.lastSkill and S.now-S.lastSkillAt<1.2 then combo=combo.." → Skill "..tostring(S.lastSkill) end
-        return combo,string.format("%s · skills %d sent / %d verified",S.combatState,S.skills,S.verified),(S.combatState=="RECOVERY" and C.red) or (S.defense~="READY" and C.gold) or (S.target and C.green) or C.gray end)
-    tile(6,"Health · Risk",function(S)
-        if S.dead then return "DEAD","waiting for respawn",C.red end
-        local hp=S.hpPct and string.format("%d%%",math.floor(S.hpPct+.5)) or "—"
-        local risk=S.risk>=70 and "HIGH" or (S.risk>=40 and "ELEVATED" or "SAFE")
-        return hp.."  ·  "..risk,string.format("risk %.0f  ·  %.0f dmg/s",S.risk,S.dps),(S.emergency and C.red) or U.hpColor(S.hpPct) end)
-    -- stop everything with verified cleanup
-    local stop=U.n("TextButton",page,{Size=UDim2.new(1,-4,0,44),BackgroundColor3=C.redDim,Text="Stop everything",TextColor3=C.red,TextSize=14,Font=U.F.bold,AutoButtonColor=false,BorderSizePixel=0,LayoutOrder=4}); U.round(stop,14); U.stroke(stop,C.red,1,.6)
+    local btnRow=U.n("Frame",hero,{Size=UDim2.new(1,0,0,52),BackgroundTransparency=1})
+    local main=U.n("TextButton",btnRow,{Size=UDim2.new(1,-120,1,0),BackgroundColor3=C.goldDim,Text="START RAVYN",TextColor3=C.gold,TextSize=16,Font=U.F.bold,AutoButtonColor=false,BorderSizePixel=0})
+    U.round(main,15); local mainStroke=U.stroke(main,C.gold,1,.42); U.pressable(main,{hoverScale=1.012,pressScale=.965,enterColor=Color3.fromRGB(76,64,30),leaveColor=C.goldDim})
+    local stop=U.n("TextButton",btnRow,{Size=UDim2.new(0,108,1,0),Position=UDim2.new(1,-108,0,0),BackgroundColor3=C.redDim,Text="Stop",TextColor3=C.red,TextSize=14,Font=U.F.bold,AutoButtonColor=false,BorderSizePixel=0})
+    U.round(stop,15); U.stroke(stop,C.red,1,.58); U.pressable(stop,{hoverScale=1.018,pressScale=.955,enterColor=Color3.fromRGB(76,24,26),leaveColor=C.redDim})
     local busy=false
-    table.insert(RAVYN._connections,stop.MouseEnter:Connect(function() U.anim(stop,.12,{BackgroundColor3=Color3.fromRGB(84,26,28)}) end))
-    table.insert(RAVYN._connections,stop.MouseLeave:Connect(function() U.anim(stop,.16,{BackgroundColor3=C.redDim}) end))
+    table.insert(RAVYN._connections,main.Activated:Connect(function()
+        if busy then return end; busy=true
+        local r
+        if GO.active then r=RAVYN:GoPause() else r=RAVYN:Go(RAVYN.Config.Go.Goal) end
+        if r and not r.ok then U.report(r) end
+        task.delay(.3,function() busy=false end)
+    end))
     table.insert(RAVYN._connections,stop.Activated:Connect(function()
-        if busy then return end; busy=true; stop.Text="Stopping…"; U.setColor(stop,"TextColor3",C.orange)
-        pcall(function()
-            RAVYN:SetAutoPlay(false)
-            for _,f in ipairs({"NORMAL_MOB","BOSS","ATTACK","ABILITIES"}) do RAVYN:SetFeature(f,false) end
-            RAVYN:SetKillAura(false)
-            RAVYN:Stop()
-        end)
+        pcall(function() RAVYN:SetAutoPlay(false); RAVYN:SetKillAura(false); RAVYN:SetFeature("NORMAL_MOB",false); RAVYN:SetFeature("BOSS",false); RAVYN:Stop() end)
         task.delay(.35,function()
             local MO=RAVYN.MoveOwner or {}; local NC=RAVYN.NoclipController or {}; local CM=RAVYN.CombatMobility or {}
-            local problems={}
-            if MO.current~="IDLE" then table.insert(problems,"movement "..tostring(MO.current)) end
-            if NC.active then table.insert(problems,"noclip") end
-            if CM.bodyVelocity or CM.bodyGyro then table.insert(problems,"movers") end
-            if RAVYN.FSM.state~="STOPPED" then table.insert(problems,"runtime "..RAVYN.FSM.state) end
-            if #problems==0 then
-                stop.Text="Stopped · collision restored · movers removed · inputs released"; U.setColor(stop,"TextColor3",C.green)
-                U.toast("Stopped · character restored","success")
-            else
-                stop.Text="Stop incomplete: "..table.concat(problems,", "); U.setColor(stop,"TextColor3",C.red); U.toast("Stop incomplete · see Diagnostics","error",true)
-            end
-            task.delay(3,function() busy=false; stop.Text="Stop everything"; U.setColor(stop,"TextColor3",C.red) end)
+            local okStop=MO.current=="IDLE" and not NC.active and not CM.bodyVelocity and RAVYN.FSM.state=="STOPPED"
+            U.toast(okStop and "Stopped" or "Stop incomplete · see Settings → Developer",okStop and "success" or "error")
         end)
     end))
-    -- profile + feed
-    local _,prof=U.card(page,"Combat profile","One preset controls distances and tempo.",{order=5})
-    U.segment(prof,{"Safe","Balanced","Aggressive"},function() return cfg().SmartCombat.Profile end,function(v) return RAVYN:SetSmartProfile(v) end)
-    local _,feed=U.card(page,"Live activity","Most recent automation events.",{order=6,collapsible=true})
+    U.addRefresh(function(S)
+        U.setText(goalL,string.upper(S.goalTitle))
+        -- status badge
+        local sColor=S.globalColor; local sLabel=S.global or "IDLE"
+        U.setText(stateL,sLabel); U.setColor(stateL,"TextColor3",sColor); U.setColor(sDot,"BackgroundColor3",sColor); U.setColor(sBadge,"BackgroundColor3",U.dimOf(sColor))
+        local st=S.go.state
+        local label=(not S.go.active and "START RAVYN") or (S.go.paused and "RESUME RAVYN") or "PAUSE RAVYN"
+        if not busy then U.setText(main,label) end
+        local running=S.go.active and not S.go.paused
+        U.setColor(main,"BackgroundColor3",running and C.raised or C.goldDim); U.setColor(main,"TextColor3",running and C.text or C.gold); U.setColor(mainStroke,"Color",running and C.line or C.gold)
+        for key,b in pairs(goalBtns) do
+            local on=key==S.go.goal; local ok=GO.available(key)
+            U.setColor(b,"BackgroundColor3",on and C.goldDim or C.card)
+            U.setColor(b,"TextColor3",(on and C.gold) or (ok and C.sub) or C.faint)
+        end
+    end)
+    -- what RAVYN is doing
+    local _,info=U.card(page,"Now","",{order=2})
+    U.kv(info,"Current",function(S) return S.headline,C.text end,{size=14})
+    U.kv(info,"Target",function(S) if not S.target then return "—",C.gray end; return (S.target.boss and "◆ " or "")..S.target.name..(S.target.hpPct and string.format("  ·  %d%%",math.floor(S.target.hpPct+.5)) or ""),S.target.boss and C.gold or C.text end,{size=14})
+    U.kv(info,"Progress",function(S) return S.progressText,S.progressText=="—" and C.gray or C.purple end,{size=14})
+    U.bar(info,function(S)
+        if S.quest.progress and S.quest.required and S.quest.required>0 then return S.quest.progress/S.quest.required,C.purple end
+        if S.loot.active and S.loot.detected>0 then return S.loot.collected/S.loot.detected,C.gold end
+        if S.target and S.target.hpPct then return 1-S.target.hpPct/100,C.green end
+        return 0,C.gray end)
+    U.kv(info,"Next",function(S) return S.next,C.sub end,{size=14})
+    local _,me=U.card(page,"You","",{order=3})
+    U.kv(me,"Health",function(S) if S.dead then return "Down · respawning",C.red end; return S.hpPct and string.format("%d%%",math.floor(S.hpPct+.5)) or "—",U.hpColor(S.hpPct) end)
+    U.bar(me,function(S) return (S.hpPct or 0)/100,U.hpColor(S.hpPct) end)
+    U.kv(me,"Level",function(S) return S.level and tostring(S.level) or "—",C.text end)
+    -- recent meaningful events
+    local _,feed=U.card(page,"Recent","",{order=4,collapsible=true,collapsed=true})
     local lines={}
-    for i=1,6 do lines[i]=U.label(feed,"",11,C.sub,U.F.mono,{Size=UDim2.new(1,0,0,16),TextWrapped=false,TextTruncate=Enum.TextTruncate.AtEnd}) end
+    for i=1,5 do lines[i]=U.label(feed,"",11,C.sub,U.F.body,{Size=UDim2.new(1,0,0,16),TextWrapped=false,TextTruncate=Enum.TextTruncate.AtEnd}) end
     U.addRefresh(function()
         local f=(RAVYN.AutoPlay384 and RAVYN.AutoPlay384.feed) or {}
-        for i=1,6 do
+        for i=1,5 do
             local e=f[#f-i+1]
             if e then U.setText(lines[i],e.clock.."  "..e.text); U.setColor(lines[i],"TextColor3",(e.kind=="success" and C.green) or (e.kind=="warn" and C.orange) or (e.kind=="error" and C.red) or C.sub)
-            else U.setText(lines[i],i==1 and "No events yet" or "") end
+            else U.setText(lines[i],i==1 and "Nothing yet" or "") end
         end
     end)
 end
@@ -8709,50 +14028,64 @@ function U.buildAutoPlay(page)
     U.toggle(m,{label="Boss rotation",desc="Chain eligible bosses, skip respawning ones",get=function() return cfg().AutoPlayV38.BossRotation end,set=function(v) return RAVYN:SetAutoPlayBossRotation(v) end,dep=function() return cfg().AutoPlayV38.Mode=="Smart" end,depText="Only used in Smart mode"})
     U.toggle(m,{label="Farm while waiting",desc="Normal mobs when no boss or quest target is available",get=function() return cfg().AutoPlayV38.PreFarm end,set=function(v) return RAVYN:SetAutoPlayPreFarm(v) end,dep=function() return cfg().AutoPlayV38.Mode=="Smart" end,depText="Only used in Smart mode"})
     U.segment(m,{{"No limit",0},{"1 boss",1},{"3 bosses",3},{"5 bosses",5}},function() return cfg().AutoPlayV38.StopAfterBosses end,function(v) return RAVYN:SetAutoPlayStopAfterBosses(v) end)
-    local _,s=U.card(page,"Scheduler","Priority owner right now.",{order=2})
+    local schedCard,s=U.card(page,"Scheduler","Priority owner right now.",{order=2}); U.devOnly(schedCard)
     U.kv(s,"Job",function(S) return S.job.."  ·  P"..S.priority,S.globalColor end)
     U.kv(s,"Interrupt",function(S) return S.overlay or "none",S.overlay and C.gold or C.gray end)
     U.kv(s,"Movement owner",function(S) return S.owner,U.ownerColor(S.owner) end)
     U.kv(s,"Eligible bosses",function(S) return tostring(S.eligibleBosses),S.eligibleBosses>0 and C.gold or C.gray end)
-    local _,cap=U.card(page,"Capabilities","What Auto Play can actually execute today.",{order=3,collapsible=true})
-    local rows={
-        {"Travel · Hover · Combat","LIVE",C.green},{"Dynamic skills","LIVE",C.green},{"Threat learning / dodge","LIVE · evidence-gated",C.green},
-        {"Quest accept / turn-in","PARTIAL · prompt + text verified",C.orange},{"Non-kill objectives","UNRESOLVED",C.gray},
-        {"Chest / drop loot","PARTIAL · prompt verified",C.orange},{"Perfect parry","EVIDENCE REQUIRED",C.gray},{"Weapon equip","UNRESOLVED",C.gray},{"InstaKill","UNRESOLVED · not pursued",C.gray},
-    }
-    for _,r in ipairs(rows) do U.kv(cap,r[1],function() return r[2],r[3] end) end
+    local capCard,cap=U.card(page,"Capabilities","Read from the single capability provider. Nothing is VERIFIED until live evidence confirms it.",{order=3,collapsible=true}); U.devOnly(capCard)
+    for _,k in ipairs((RAVYN.GameKnowledge and RAVYN.GameKnowledge.capOrder) or {}) do U.capRow(cap,k) end
 end
 
 -- ================= QUESTS =================
 function U.buildQuests(page)
-    local _,c=U.card(page,"Quest sources","Crow, Muzan and other quest givers share one quest brain. Sources are found at any streamed distance and approached automatically. Runs while Auto Play is on.",{order=1,
+    -- ── Crow Hunt hero card ──────────────────────────────────────────────────
+    local crowCard,crow=U.card(page,"Crow Hunts","Boss Hunt missions issued by the Kasugai Crow.",{order=0,
+        warn=function(S) return (S.questEnabled and not S.autoplay) and C.orange or nil end})
+    U.kv(crow,"Status",function() local x=RAVYN.CrowDirect; if not x then return "Unavailable",C.red end; return x.status,(x.status=="ACTIVE" and C.green) or (x.status=="DAILY_COMPLETE" and C.gold) or (x.status=="COOLDOWN" and C.orange) or C.sub end)
+    U.kv(crow,"Mission",function() local x=RAVYN.CrowDirect; if not x then return "—",C.gray end; return x.detail or x.mission or "—",C.text end)
+    U.kv(crow,"Progress",function(S) if S.quest.source=="CROW" and S.quest.progress then return string.format("%d / %d",S.quest.progress,S.quest.required or 0),C.purple end; return "—",C.gray end)
+    U.bar(crow,function(S) if S.quest.source=="CROW" and S.quest.progress and S.quest.required and S.quest.required>0 then return S.quest.progress/S.quest.required,C.purple end; return 0,C.purple end)
+    U.kv(crow,"Next available",function() local x=RAVYN.CrowDirect; if not x then return "—",C.gray end; local cd=x.cooldown; return cd and tostring(cd) or (x.status=="DAILY_COMPLETE" and "Tomorrow") or "Now",cd and C.orange or C.green end)
+    U.toggle(crow,{label="Auto Crow Hunts",desc="Open Crow → claim a Hunt → teleport → fight → loot → next",get=function() return RAVYN.Config.CrowDirect and RAVYN.Config.CrowDirect.Enabled end,set=function(v) return RAVYN:SetCrowHunts(v) end,
+        status=function() local st=U.crowState and U.crowState() or "OFF"; return st,U.stateColor and U.stateColor(st) or C.sub end})
+    U.devOnly(U.button(crow,"Reset Crow daily state",function() return RAVYN:ResetCrowDaily() end))
+    -- ── Quest sources (advanced) ─────────────────────────────────────────────
+    local _,c=U.card(page,"Other quest sources","Generic quests stay available; Muzan remains evidence-gated.",{order=1,
         warn=function(S) return (S.questEnabled and not S.autoplay) and C.orange or nil end})
     local qc=function() return cfg().QuestBrain end
     local qs=function(k) return function(v) return RAVYN:SetQuestOption(k,v) end end
-    U.toggle(c,{label="Auto Crow quests",desc="Find Crow → accept → objective → turn in",get=function() return qc().AutoCrow end,set=qs("AutoCrow"),
-        status=function(S,on) if not on then return "OFF",C.gray end; return (S.quest.source=="CROW" and S.quest.state) or "READY",S.autoplay and C.purple or C.orange end})
-    U.toggle(c,{label="Repeat Crow",get=function() return qc().RepeatCrow end,set=qs("RepeatCrow"),dep=function() return qc().AutoCrow end,depText="Enable Auto Crow first"})
-    U.toggle(c,{label="Auto Muzan quests",desc="Same lifecycle, Muzan as source",get=function() return qc().AutoMuzan end,set=qs("AutoMuzan"),
-        status=function(S,on) if not on then return "OFF",C.gray end; return (S.quest.source=="MUZAN" and S.quest.state) or "READY",S.autoplay and C.purple or C.orange end})
-    U.toggle(c,{label="Repeat Muzan",get=function() return qc().RepeatMuzan end,set=qs("RepeatMuzan"),dep=function() return qc().AutoMuzan end,depText="Enable Auto Muzan first"})
+    -- v3.8.5.1: Crow/Muzan automation is not claimed. Status comes from the capability provider.
+    U.capRow(c,"CROW_MISSION")
+    U.kv(c,"Crow Boss Hunts",function() local x=RAVYN.CrowDirect; if not x then return "Unavailable",C.red end; return x.status.." · "..(x.detail or ""), (x.status=="ACTIVE" and C.green) or (x.status=="DAILY_COMPLETE" and C.green) or C.gold end)
+    U.devOnly(U.button(c,"Reset Crow daily state",function() return RAVYN:ResetCrowDaily() end))
+    U.capRow(c,"MUZAN_HUNT")
+    U.devOnly(U.label(c,"Record the Muzan task flow before automation is enabled.",11,C.sub,U.F.body))
+    U.devOnly(U.button(c,"Research Muzan",function() if U.openResearch then U.openResearch("Muzan · task menu") end; return false end))
     U.toggle(c,{label="Other quest givers",desc="Generic quest/mission prompts",get=function() return qc().AutoQuest end,set=qs("AutoQuest")})
-    U.toggle(c,{label="Learn target by nearby kills",desc="Off: unresolved targets are investigated via quest markers only",get=function() return qc().LearnByNearbyKills end,set=qs("LearnByNearbyKills"),
-        tip="When a quest does not name its target and no marker identifies it, ON farms nearby mobs and credits the kill that advanced the counter. OFF waits for evidence."})
+    U.devOnly(U.toggle(c,{label="Learn target by nearby kills",desc="Off: unresolved targets are investigated via quest markers only",get=function() return qc().LearnByNearbyKills end,set=qs("LearnByNearbyKills"),
+        tip="When a quest does not name its target and no marker identifies it, ON farms nearby mobs and credits the kill that advanced the counter. OFF waits for evidence."}))
     U.toggle(c,{label="Auto turn-in",desc="Return to the source when the objective completes",get=function() return qc().AutoTurnIn end,set=qs("AutoTurnIn"),
-        dep=function() return qc().AutoCrow or qc().AutoMuzan or qc().AutoQuest end,depText="Enable a quest source first"})
+        dep=function() return qc().AutoQuest end,depText="Enable a quest source first"})
     local _,q=U.card(page,"Current quest","",{order=2,warn=function(S) local e=U.explain(S.quest.fail); return (e and e.color~=C.gold) and e.color or nil end})
     U.kv(q,"Source",function(S) return S.quest.source..(S.quest.sourceName and ("  ·  "..S.quest.sourceName) or ""),S.quest.source=="CROW" and C.purple or (S.quest.source=="MUZAN" and C.red or C.sub) end)
-    U.kv(q,"State",function(S) return S.quest.state,(S.quest.fail and C.orange) or C.purple end)
+    U.kv(q,"Doing",function(S) return S.plain,C.text end)
+    U.devRow(U.kv(q,"State",function(S) return S.quest.state,(S.quest.fail and C.orange) or C.purple end))
     U.kv(q,"Objective",function(S) return S.quest.objective,C.text end)
     U.kv(q,"Target",function(S) if S.quest.target then return S.quest.target,C.text end; return (S.quest.objective=="KILL") and "Learning…" or "—",C.gold end)
-    U.kv(q,"Confidence",function(S) local c2=S.quest.confidence; return c2,(c2=="VERIFIED" and C.green) or (c2=="HIGH" and C.green) or (c2=="TEXT MATCH" and C.cyan) or C.gold end)
+    U.devRow(U.kv(q,"Confidence",function(S) local c2=S.quest.confidence; return c2,(c2=="VERIFIED" and C.green) or (c2=="HIGH" and C.green) or (c2=="TEXT MATCH" and C.cyan) or C.gold end))
     U.kv(q,"Progress",function(S) if S.quest.progress then return string.format("%d / %d",S.quest.progress,S.quest.required or 0),S.quest.stalled and C.orange or C.green end; return "—",C.gray end)
     U.bar(q,function(S) if S.quest.progress and S.quest.required and S.quest.required>0 then return S.quest.progress/S.quest.required,C.purple end; return 0,C.purple end)
-    U.kv(q,"Navigation",function(S) if S.quest.nav then return S.owner=="TRAVEL" and S.travelMode or "ARRIVED",C.cyan end; return (S.target and S.owner) or "—",U.ownerColor(S.owner) end)
-    U.kv(q,"Level",function(S) return S.quest.level and ("Lv "..S.quest.level) or "—",C.sub end)
-    U.kv(q,"Session",function(S) return string.format("%d accepted · %d turned in",S.quest.accepted,S.quest.completed),C.sub end)
+    U.devRow(U.kv(q,"Navigation",function(S) if S.quest.nav then return S.owner=="TRAVEL" and S.travelMode or "ARRIVED",C.cyan end; return (S.target and S.owner) or "—",U.ownerColor(S.owner) end))
+    U.devRow(U.kv(q,"Level",function(S) return S.quest.level and ("Lv "..S.quest.level) or "—",C.sub end))
+    U.kv(q,"Completed",function(S) return string.format("%d this session",S.quest.completed),C.sub end)
+    U.devRow(U.kv(q,"Data cross-check",function()
+        local d=RAVYN.QuestBrain and RAVYN.QuestBrain.dataCheck; if not d then return "—",C.gray end
+        return d.agreement..(#d.dataQuests>0 and ("  ·  data: "..table.concat(d.dataQuests,", ")) or ""),(d.agreement=="MATCH" and C.green) or (d.agreement=="BOTH_EMPTY" and C.gray) or C.orange end))
+    U.devRow(U.kv(q,"QuestStates identity",function()
+        local id=RAVYN.QuestBrain and RAVYN.QuestBrain.questIdentity; return id or "—",id and C.cyan or C.gray end))
     U.warning(q,function(S) return S.quest.fail end)
-    local _,pr=U.card(page,"QuestProbe","Evidence capture only. Quest reading stays UNRESOLVED until live before/after pairs map it. Snapshots are taken automatically around accept, kill and turn-in.",{order=3,collapsible=true,collapsed=true})
+    local prCard,pr=U.card(page,"QuestProbe","Evidence capture only. Quest reading stays UNRESOLVED until live before/after pairs map it. Snapshots are taken automatically around accept, kill and turn-in.",{order=3,collapsible=true,collapsed=true}); U.devOnly(prCard)
     U.kv(pr,"Captured pairs",function() local QB=RAVYN.QuestBrain; local n=QB and QB.probe and #QB.probe.reports or 0; return tostring(n),n>0 and C.green or C.gray end)
     U.button(pr,"Manual snapshot (press before, then after)",function() return RAVYN:CaptureQuestProbe("MANUAL") end,"accent")
     U.button(pr,"Copy QuestProbe report",function() return RAVYN:CopyQuestProbeReport() end)
@@ -8824,36 +14157,55 @@ function U.buildCombat(page)
     U.kv(live,"Target",function(S) if not S.target then return "None",C.gray end; return (S.target.boss and "◆ " or "")..S.target.name,S.target.boss and C.gold or C.text end)
     U.bar(live,function(S) if S.target and S.target.hpPct then return S.target.hpPct/100,U.hpColor(S.target.hpPct) end; return 0,C.gray end,8)
     U.kv(live,"Distance",function(S) return S.target and U.fmtDist(S.target.dist) or "—",C.sub end)
-    U.kv(live,"Hover",function(S) return S.hover,(string.find(S.hover,"LOCKED",1,true) and C.green) or (S.hover=="FOLLOWING" and C.cyan) or (S.hover=="DEFENSE OVERRIDE" and C.gold) or C.gray end)
-    U.kv(live,"Combo",function(S)
+    U.devRow(U.kv(live,"Hover",function(S) return S.hover,(string.find(S.hover,"LOCKED",1,true) and C.green) or (S.hover=="FOLLOWING" and C.cyan) or (S.hover=="DEFENSE OVERRIDE" and C.gold) or C.gray end))
+    U.kv(live,"Doing",function(S) return S.plain,(S.plain=="Recovering" and C.red) or C.text end)
+    U.devRow(U.kv(live,"Combo",function(S)
         local t=S.combo>0 and ("M1 ×"..S.combo) or "—"
         if S.lastSkill and S.now-S.lastSkillAt<1.5 then t=t.."  →  Skill "..tostring(S.lastSkill) end
-        return t,C.text end)
-    U.kv(live,"Combat state",function(S) local st=S.combatState; return st,(st=="RECOVERY" and C.red) or (st=="DEFENSE_INTERRUPT" and C.gold) or (st=="SKILL_CAST" and C.cyan) or (st=="APPROACH" and C.cyan) or (st=="IDLE" and C.gray) or C.green end)
-    U.kv(live,"Next action",function(S) return S.nextAction,C.text end)
+        return t,C.text end))
+    U.devRow(U.kv(live,"Combat state",function(S) local st=S.combatState; return st,(st=="RECOVERY" and C.red) or (st=="DEFENSE_INTERRUPT" and C.gold) or (st=="SKILL_CAST" and C.cyan) or (st=="APPROACH" and C.cyan) or (st=="IDLE" and C.gray) or C.green end))
+    U.devRow(U.kv(live,"Next action",function(S) return S.nextAction,C.text end))
     U.kv(live,"Last skill",function(S) if not S.lastSkill then return "—",C.gray end; local v=S.lastSkillVerdict or "?"; return tostring(S.lastSkill).."  ·  "..v,(v=="VERIFIED" and C.green) or (v=="CASTING" and C.cyan) or C.orange end)
-    U.kv(live,"Skills",function(S) return string.format("discovered %d  ·  sent %d  ·  verified %d",S.discovered,S.skills,S.verified),S.verified>0 and C.green or (S.skills>0 and C.orange or C.sub) end)
+    U.kv(live,"Skills",function(S) return string.format("%d found  ·  %d confirmed casts",S.discovered,S.verified),S.verified>0 and C.green or (S.skills>0 and C.orange or C.sub) end)
     U.kv(live,"Defense",function(S) return S.defense,S.defense=="READY" and C.green or C.gold end)
-    U.kv(live,"Recovery",function(S) return S.recovery,(S.recovery=="STANDBY" and C.gray) or (string.find(S.recovery,"RESUMING",1,true) and C.green) or C.red end)
-    U.kv(live,"M1 sent",function(S) return tostring(S.m1),C.sub end)
+    U.devRow(U.kv(live,"Recovery",function(S) return S.recovery,(S.recovery=="STANDBY" and C.gray) or (string.find(S.recovery,"RESUMING",1,true) and C.green) or C.red end))
+    U.devRow(U.kv(live,"M1 sent",function(S) return tostring(S.m1),C.sub end))
     U.warning(live,function(S) local f=S.skillFail; if f=="OK" or f=="IDLE" or f=="COMBO_WAIT_M1" then return nil end; return f end)
-    local _,e=U.card(page,"Combat engine","One executor sends every M1 and skill.",{order=2})
-    U.toggle(e,{label="Auto attack (M1)",get=function() return cfg().Combat.AutoAttack end,set=function(v) return RAVYN:SetFeature("ATTACK",v) end,
+    local _,e=U.card(page,"Combat","RAVYN finds your skills and uses them automatically.",{order=2})
+    U.segment(e,{{"Safe","SAFE"},{"Fast","FAST"},{"Max","MAX"}},function() return cm().CombatSpeed end,setc("CombatMobility.CombatSpeed"))
+    U.label(e,"Max = fastest verified combat (adaptive M1 + confirmed skills). No fake instant kills.",11,C.sub,U.F.body)
+    U.kv(e,"One hit",function()
+        local IK=RAVYN.InstaKillAdapter
+        if IK and IK.activeClass and IK.activeClass()=="THRESHOLD_99" then return "THRESHOLD FINISHER · 99% · TRUE ONE-HIT: NO VALID PATH",C.gold end
+        return "MAX BURST · TRUE ONE-HIT: NO VALID PATH",C.orange end)
+    U.toggle(e,{label="Auto attack",get=function() return cfg().Combat.AutoAttack end,set=function(v) return RAVYN:SetFeature("ATTACK",v) end,
         status=function(S,on) if not on then return "OFF",C.gray end; return S.target and "FIRING" or "READY",S.target and C.green or C.sub end})
-    U.toggle(e,{label="Auto skills",desc="Hotbar is discovered live; no build is hard-coded",get=function() return cfg().Combat.AutoAbilities end,set=function(v) return RAVYN:SetFeature("ABILITIES",v) end,
+    U.toggle(e,{label="Smart skills",desc="Finds your hotbar keys and learns cooldowns",get=function() return cfg().Combat.AutoAbilities end,set=function(v) return RAVYN:SetFeature("ABILITIES",v) end,
         status=function(S,on)
             if not on then return "OFF",C.gray end
             local x=U.explain(S.skillFail); if S.skillFail=="OK" then return "FIRING",C.green end
             if S.discovered==0 then return x and string.upper(x.title) or "NO HOTBAR",C.orange end
             return S.discovered.." FOUND",C.sub end})
-    U.toggle(e,{label="Hold combo",desc="M1 chain, then decide: skill or continue",get=function() return cm().HoldCombo end,set=setc("CombatMobility.HoldCombo"),dep=function() return cfg().Combat.AutoAttack end,depText="Needs Auto attack"})
-    U.segment(e,{{"2 hits",2},{"3 hits",3},{"4 hits",4},{"5 hits",5}},function() return cm().ComboLength end,setc("CombatMobility.ComboLength"),{dep=function() return cm().HoldCombo end,depText="Needs Hold combo"})
-    U.toggle(e,{label="Turbo M1",desc="Fast M1 cadence",get=function() return cm().TurboM1 end,set=setc("CombatMobility.TurboM1"),dep=function() return cfg().Combat.AutoAttack end,depText="Needs Auto attack"})
-    U.toggle(e,{label="Aggressive skills",desc="Shorter skill interval",get=function() return cm().AggressiveSkills end,set=setc("CombatMobility.AggressiveSkills"),dep=function() return cfg().Combat.AutoAbilities end,depText="Needs Auto skills"})
-    U.toggle(e,{label="Keep combo while hit",desc="Normal damage keeps the combo; critical HP still overrides",get=function() return cm().KeepComboUnderHit end,set=setc("CombatMobility.KeepComboUnderHit"),
-        tip="Survival is never disabled: critical health and learned dangerous attacks still interrupt the combo."})
-    U.toggle(e,{label="Smart safety",desc="Risk engine evades on dangerous health/damage",get=function() return cfg().SmartCombat.Enabled end,set=setc("SmartCombat.Enabled")})
-    local _,mit=U.card(page,"Control mitigation","Client-side, best effort. The server may reapply its own states.",{order=3,collapsible=true})
+    U.devOnly(U.toggle(e,{label="Hold combo",desc="M1 chain, then decide: skill or continue",get=function() return cm().HoldCombo end,set=setc("CombatMobility.HoldCombo"),dep=function() return cfg().Combat.AutoAttack end,depText="Needs Auto attack"}))
+    U.devOnly(U.segment(e,{{"2 hits",2},{"3 hits",3},{"4 hits",4},{"5 hits",5}},function() return cm().ComboLength end,setc("CombatMobility.ComboLength"),{dep=function() return cm().HoldCombo end,depText="Needs Hold combo"}))
+    U.devOnly(U.toggle(e,{label="Turbo M1 · experimental",desc="0.09s cadence; overrides Combat Speed",get=function() return cm().TurboM1 end,set=setc("CombatMobility.TurboM1"),dep=function() return cfg().Combat.AutoAttack end,depText="Needs Auto attack"}))
+    U.devOnly(U.toggle(e,{label="Aggressive skills",desc="Shorter skill interval",get=function() return cm().AggressiveSkills end,set=setc("CombatMobility.AggressiveSkills"),dep=function() return cfg().Combat.AutoAbilities end,depText="Needs Auto skills"}))
+    U.toggle(e,{label="Keep combo while hit",desc="Normal damage keeps the combo",get=function() return cm().KeepComboUnderHit end,set=setc("CombatMobility.KeepComboUnderHit")})
+    U.toggle(e,{label="Recovery",desc="Auto-recover from ragdoll, falling and physics states",get=function() return cm().NoRagdoll end,set=function(v) RAVYN:SetConfig("CombatMobility.AntiRagdoll",v); return RAVYN:SetConfig("CombatMobility.NoRagdoll",v) end,
+        status=function(S,on) return on and (tostring(S.mitigation.ragdoll or 0).." FIXED") or "OFF",on and C.green or C.gray end})
+    U.toggle(e,{label="Adaptive defense",desc="Reactive dodge and guard against verified threats",get=function() return cfg().CombatEvolution.Defense.AdaptiveDodge end,set=setc("CombatEvolution.Defense.AdaptiveDodge")})
+    U.toggle(e,{label="Low HP safety escape",desc="OFF = keep your chosen combat height even when HP is low",get=function() return cfg().SmartCombat.HealthSafetyEscape end,set=setc("SmartCombat.HealthSafetyEscape")})
+    -- Combat positioning (quick access – full controls also on Travel)
+    local _,pos=U.card(page,"Combat positioning","Hover position while fighting. Full controls on Travel page.",{order=3})
+    U.toggle(pos,{label="Combat hover",get=function() return cm().FlyFarmFight end,set=setc("CombatMobility.FlyFarmFight"),
+        status=function(S,on) if not on then return "OFF",C.gray end; return (string.find(S.hover,"LOCKED",1,true) and "LOCKED") or S.hover,(string.find(S.hover,"LOCKED",1,true) and C.green) or C.sub end})
+    U.segment(pos,{{"Above","ABOVE"},{"Behind","ABOVE_BEHIND"},{"Orbit","ORBIT_HOVER"}},function() return cm().HoverMode end,setc("CombatMobility.HoverMode"),{dep=function() return cm().FlyFarmFight end,depText="Enable Combat hover first"})
+    U.label(pos,"Height",12,C.sub,U.F.semi)
+    U.segment(pos,{{"3",3},{"5",5},{"8",8},{"12",12},{"18",18},{"25",25}},function() return cm().FlyHeight end,setc("CombatMobility.FlyHeight"),{dep=function() return cm().FlyFarmFight end,depText="Enable Combat hover first"})
+    U.label(pos,"Distance",12,C.sub,U.F.semi)
+    U.segment(pos,{{"2",2},{"3",3},{"5",5},{"8",8},{"12",12},{"16",16}},function() return cm().HoverDistance or 3 end,setc("CombatMobility.HoverDistance"),{dep=function() return cm().FlyFarmFight end,depText="Enable Combat hover first"})
+    U.devOnly(U.toggle(e,{label="Smart safety",desc="Risk engine telemetry and advanced safety logic",get=function() return cfg().SmartCombat.Enabled end,set=setc("SmartCombat.Enabled")}))
+    local _,mit=U.card(page,"Control mitigation","Client-side, best effort. The server may reapply its own states.",{order=4,collapsible=true})
     U.toggle(mit,{label="No ragdoll",desc="Recover from ragdoll / falling / physics states",get=function() return cm().NoRagdoll end,set=function(v) RAVYN:SetConfig("CombatMobility.AntiRagdoll",v); return RAVYN:SetConfig("CombatMobility.NoRagdoll",v) end,
         status=function(S,on) return on and (tostring(S.mitigation.ragdoll or 0).." FIXED") or "OFF",on and C.green or C.gray end})
     U.toggle(mit,{label="No stun",desc="Clears observed local stun values; may be reapplied",get=function() return cm().NoStun end,set=function(v) RAVYN:SetConfig("CombatMobility.AntiStun",v); return RAVYN:SetConfig("CombatMobility.NoStun",v) end,
@@ -8862,37 +14214,44 @@ function U.buildCombat(page)
         status=function(S,on) return on and (tostring(S.mitigation.knockback or 0).." DAMPED") or "OFF",on and C.orange or C.gray end})
     U.toggle(mit,{label="No attack slowdown",desc="Only acts on an observed local slowdown source",get=function() return cm().NoAttackSlowdown end,set=setc("CombatMobility.NoAttackSlowdown"),
         status=function(S,on) return on and "NO SOURCE" or "OFF",on and C.orange or C.gray end})
-    local _,t=U.card(page,"Input test","",{order=4,collapsible=true,collapsed=true})
-    U.button(t,"Send one M1",function() return RAVYN:ClientAttack() end,"accent")
-    U.button(t,"Send next skill",function() return RAVYN:ClientSkill() end)
+    local testCard,t=U.card(page,"Input test","",{order=5,collapsible=true,collapsed=true}); U.devOnly(testCard)
+    U.button(t,"Request one M1 (bus)",function() return RAVYN.CombatActionBus:RequestAttack(nil,{manual=true,source="UI test"}) end,"accent")
+    U.button(t,"Request next skill (bus)",function() local k=currentSkillKeys(); if #k==0 then return result(false,"NO_VISIBLE_SKILL_KEYS") end; return RAVYN.CombatActionBus:RequestSkill(k[1],nil,{manual=true,source="UI test"}) end)
 end
 
 -- ================= LOOT =================
 function U.buildLoot(page)
     local lc=function() return cfg().Loot384 end
     local lo=function(k) return function(v) return RAVYN:SetLootOption(k,v) end end
-    local _,o=U.card(page,"Auto loot","Uses the game's own prompts. Collection is only counted when the drop disappears.",{order=1,warn=function(S) return S.loot.fail and C.orange or nil end})
-    U.toggle(o,{label="Loot after kill",desc="Collect everything that drops from the enemy just killed",get=function() return lc().AutoLootAfterKill end,set=lo("AutoLootAfterKill")})
-    U.toggle(o,{label="Loot chests",desc="Open nearby chests and collect all drops",get=function() return lc().AutoLootChests end,set=lo("AutoLootChests")})
-    U.toggle(o,{label="Collect nearby loot",desc="Also take clearly-classified drops not spawned by this kill",get=function() return lc().CollectNearbyLoot end,set=lo("CollectNearbyLoot"),
-        tip="Off: only drops that appeared after the kill/chest are collected. On: any nearby prompt classified as a drop."})
+    local _,o=U.card(page,"Loot","Items are only counted when they are actually picked up.",{order=1,warn=function(S) return S.loot.fail and C.orange or nil end})
+    U.toggle(o,{label="Auto loot",desc="Collect everything the enemy you killed drops",get=function() return lc().AutoLootAfterKill end,set=lo("AutoLootAfterKill")})
+    U.toggle(o,{label="Boss chests",desc="Open the boss chest and nearby chests, collect everything",get=function() return lc().AutoLootChests end,set=lo("AutoLootChests")})
+    U.devOnly(U.toggle(o,{label="Collect nearby loot",desc="Also take clearly-classified drops not spawned by this kill",get=function() return lc().CollectNearbyLoot end,set=lo("CollectNearbyLoot"),
+        tip="Off: only drops that appeared after the kill/chest are collected. On: any nearby prompt classified as a drop."}))
     local card,s=U.card(page,"Loot session","",{order=2})
-    U.kv(s,"State",function(S) return S.loot.state,(S.loot.active and C.gold) or (S.loot.state=="COMPLETE" and C.green) or C.gray end)
+    U.kv(s,"Status",function(S)
+        local st=S.loot.state
+        local plain=(not S.loot.active and st~="COMPLETE" and "Standby") or (st=="COMPLETE" and "Done") or (string.find(st,"COLLECTING",1,true) and "Collecting")
+            or ((st=="SEARCHING_CHEST" or st=="CHEST_FOUND" or st=="TRAVELING") and "Going to chest") or (st=="OPENING" and "Opening chest")
+            or (st=="CHEST_NOT_FOUND" and "No chest found") or (string.find(st,"PAUSED",1,true) and "Waiting") or "Looting"
+        return plain,(S.loot.active and C.gold) or (st=="COMPLETE" and C.green) or C.gray end)
+    U.devRow(U.kv(s,"State",function(S) return S.loot.state,(S.loot.active and C.gold) or (S.loot.state=="COMPLETE" and C.green) or C.gray end))
     local detail=U.n("Frame",s,{Size=UDim2.new(1,0,0,0),AutomaticSize=Enum.AutomaticSize.Y,BackgroundTransparency=1}); U.list(detail,8)
-    U.kv(detail,"Drops detected",function(S) return tostring(S.loot.detected),C.text end)
+    U.devRow(U.kv(detail,"Drops detected",function(S) return tostring(S.loot.detected),C.text end))
     U.kv(detail,"Collected",function(S) return string.format("%d / %d",S.loot.collected,S.loot.detected),S.loot.collected>0 and C.green or C.sub end)
     U.bar(detail,function(S) if S.loot.detected>0 then return S.loot.collected/S.loot.detected,C.gold end; return 0,C.gold end)
-    U.kv(detail,"Unverified",function(S) return tostring(S.loot.unverified),S.loot.unverified>0 and C.orange or C.sub end)
+    U.devRow(U.kv(detail,"Unverified",function(S) return tostring(S.loot.unverified),S.loot.unverified>0 and C.orange or C.sub end))
     U.kv(s,"Boss defeated",function(S) return S.loot.boss or "—",S.loot.boss and C.gold or C.gray end)
-    U.kv(s,"Expected chest",function(S) return S.loot.chestExpected or "—",S.loot.chestExpected and C.text or C.gray end)
-    U.kv(s,"Chest",function(S) local c2=S.loot.chest; return c2..(S.loot.chestVia and ("  ·  "..S.loot.chestVia) or ""),(c2=="OPEN_VERIFIED" and C.green) or (c2=="NOT_FOUND" or c2=="INTERACTION_UNRESOLVED" or c2=="OPEN_UNVERIFIED") and C.orange or C.sub end)
-    U.kv(detail,"Attempted",function(S) return tostring(S.loot.attempted),C.sub end)
-    U.kv(detail,"Remaining",function(S) return tostring(S.loot.remaining),S.loot.remaining>0 and C.gold or C.sub end)
+    U.kv(s,"Chest",function(S) return S.loot.chestExpected or "—",S.loot.chestExpected and C.text or C.gray end)
+    U.devRow(U.kv(s,"Chest state",function(S) local c2=S.loot.chest; return c2..(S.loot.chestVia and ("  ·  "..S.loot.chestVia) or ""),(c2=="OPEN_VERIFIED" and C.green) or (c2=="NOT_FOUND" or c2=="INTERACTION_UNRESOLVED" or c2=="OPEN_UNVERIFIED") and C.orange or C.sub end))
+    U.devRow(U.kv(detail,"Attempted",function(S) return tostring(S.loot.attempted),C.sub end))
+    U.devRow(U.kv(detail,"Remaining",function(S) return tostring(S.loot.remaining),S.loot.remaining>0 and C.gold or C.sub end))
     U.kv(s,"Last session",function(S) return S.loot.last,C.sub end)
-    U.kv(s,"Interaction",function() local f=(getgenv and getgenv().fireproximityprompt) or fireproximityprompt; if type(f)=="function" then return "fireproximityprompt · PARTIAL",C.orange end; return "UNRESOLVED_GAME_BINDING",C.red end)
+    U.devRow(U.kv(s,"Interaction",function() local f=(getgenv and getgenv().fireproximityprompt) or fireproximityprompt; if type(f)=="function" then return "fireproximityprompt · PARTIAL",C.orange end; return "UNRESOLVED_GAME_BINDING",C.red end))
     U.warning(s,function(S) return S.loot.fail end)
-    U.button(s,"Copy loot probe",function() return RAVYN:CopyLootProbe() end)
-    local _,h=U.card(page,"Death → loot handoff","Proves whether a target death reached the loot controller.",{order=3,collapsible=true})
+    U.devOnly(U.button(s,"Copy loot probe",function() return RAVYN:CopyLootProbe() end))
+    local hCard,h=U.card(page,"Death → loot handoff","Proves whether a target death reached the loot controller.",{order=3,collapsible=true})
+    U.devOnly(hCard)
     U.kv(h,"Target session",function(S) local x=S.handoff; if not x.session then return "none",C.gray end; return "#"..tostring(x.session)..(x.sessionName and ("  ·  "..x.sessionName) or "")..(x.source and ("  ·  "..x.source) or ""),C.text end)
     U.kv(h,"Death listener",function(S) return S.handoff.listener,S.handoff.listener=="ATTACHED" and C.green or C.gray end)
     U.kv(h,"Chest cached",function(S) return tostring(S.handoff.sessionChest or "—"),S.handoff.sessionChest and C.green or C.gray end)
@@ -8919,18 +14278,22 @@ function U.buildTravel(page)
     U.kv(m,"Travel mode",function(S) return S.travelMode,(S.travelMode=="TELEPORT" and C.gold) or C.cyan end)
     U.kv(m,"Noclip",function(S) return S.noclip and "ON · collision cached" or "OFF · collision normal",S.noclip and C.cyan or C.gray end)
     U.kv(m,"Session",function(S) return string.format("%d teleports · %d tweens",S.teleports,S.tweens),C.sub end)
-    local _,t=U.card(page,"Smart travel","Near: tween · medium: fast tween · far: one teleport per goal.",{order=2})
-    U.segment(t,{{"Tight",1},{"Normal",2},{"Long",3}},function()
-        local f=tc().FastTweenMaxDist; if f<=160 then return 1 elseif f<=260 then return 2 end; return 3 end,
-        function(v) local map={[1]={50,150},[2]={70,220},[3]={100,400}}; RAVYN:SetConfig("TravelController.TweenMaxDist",map[v][1]); return RAVYN:SetConfig("TravelController.FastTweenMaxDist",map[v][2]) end)
-    U.kv(t,"Thresholds",function() return string.format("tween ≤%d · fast ≤%d · teleport >%d",tc().TweenMaxDist,tc().FastTweenMaxDist,tc().FastTweenMaxDist),C.sub end)
-    U.toggle(t,{label="Travel noclip",desc="No collision while traveling",get=function() return tc().TravelNoclip end,set=setc("TravelController.TravelNoclip"),
+    local _,t=U.card(page,"Direct travel","All navigation uses teleport. No distance cap.",{order=2})
+    U.toggle(t,{label="Teleport only",desc="Quest, boss, loot and normal travel use instant teleport",get=function() return tc().TeleportOnly end,set=setc("TravelController.TeleportOnly")})
+    U.toggle(t,{label="Unlimited travel range",desc="Targets are not rejected because they are far away",get=function() return tc().UnlimitedRange end,set=setc("TravelController.UnlimitedRange")})
+    U.toggle(t,{label="Return to boss after death",desc="If you die while fighting a boss, teleport back after respawn",get=function() return tc().ReturnToBossOnRespawn end,set=setc("TravelController.ReturnToBossOnRespawn")})
+    U.kv(t,"Mode",function() return tc().TeleportOnly and "TELEPORT ONLY · NO DISTANCE LIMIT" or "LEGACY HYBRID",tc().TeleportOnly and C.green or C.orange end)
+    U.toggle(t,{label="Travel noclip",desc="No collision while teleport/travel owns movement",get=function() return tc().TravelNoclip end,set=setc("TravelController.TravelNoclip"),
         tip="Collision is cached per part and restored exactly when travel ends, on Stop, respawn or Destroy."})
     local _,h=U.card(page,"Combat hover","Above and slightly behind the target; follows its height.",{order=3})
     U.toggle(h,{label="Combat hover",get=function() return cm().FlyFarmFight end,set=setc("CombatMobility.FlyFarmFight"),
         status=function(S,on) if not on then return "OFF",C.gray end; return (string.find(S.hover,"LOCKED",1,true) and "LOCKED") or S.hover,(string.find(S.hover,"LOCKED",1,true) and C.green) or C.sub end})
-    U.segment(h,{{"Above","ABOVE"},{"Above behind","ABOVE_BEHIND"},{"Orbit","ORBIT_HOVER"}},function() return cm().HoverMode end,setc("CombatMobility.HoverMode"),{dep=function() return cm().FlyFarmFight end,depText="Enable Combat hover first"})
-    U.segment(h,{{"Low",4},{"Normal",5.5},{"High",7.5}},function() return cm().FlyHeight end,setc("CombatMobility.FlyHeight"),{dep=function() return cm().FlyFarmFight end,depText="Enable Combat hover first"})
+    U.segment(h,{{"Above","ABOVE"},{"Behind","ABOVE_BEHIND"},{"Orbit","ORBIT_HOVER"}},function() return cm().HoverMode end,setc("CombatMobility.HoverMode"),{dep=function() return cm().FlyFarmFight end,depText="Enable Combat hover first"})
+    U.label(h,"Height above target",12,C.sub,U.F.semi)
+    U.segment(h,{{"3",3},{"5",5},{"8",8},{"12",12},{"18",18},{"25",25}},function() return cm().FlyHeight end,setc("CombatMobility.FlyHeight"),{dep=function() return cm().FlyFarmFight end,depText="Enable Combat hover first"})
+    U.label(h,"Horizontal distance from target",12,C.sub,U.F.semi)
+    U.segment(h,{{"2",2},{"3",3},{"5",5},{"8",8},{"12",12},{"16",16}},function() return cm().HoverDistance or 3 end,setc("CombatMobility.HoverDistance"),{dep=function() return cm().FlyFarmFight end,depText="Enable Combat hover first"})
+    U.toggle(h,{label="Low HP safety escape",desc="OFF = never climb/retreat just because your HP drops",get=function() return cfg().SmartCombat.HealthSafetyEscape end,set=setc("SmartCombat.HealthSafetyEscape")})
     U.toggle(h,{label="Combat noclip",desc="No collision while hover owns movement",get=function() return tc().CombatNoclip end,set=setc("TravelController.CombatNoclip"),dep=function() return cm().FlyFarmFight end,depText="Enable Combat hover first",
         tip="Disables character collision while Combat Hover owns movement. Original collision is restored when combat ends."})
     local _,p=U.card(page,"Saved places","Positions you recorded yourself.",{order=4,collapsible=true})
@@ -9034,6 +14397,12 @@ function U.buildDiagnostics(page)
             "error        "..tostring(S.error),
             "",
         }
+        local GKx=RAVYN.GameKnowledge
+        if GKx then
+            local caps={}
+            for _,k in ipairs(GKx.capOrder) do local c=GKx.capabilities[k]; if c.status~="VERIFIED" then table.insert(caps,k.."="..c.status) end end
+            table.insert(lines,"caps         "..table.concat(caps," "))
+        end
         for key,st in pairs(S.skillStats) do
             table.insert(lines,string.format("skill %-3s sent %d  ver %d  unv %d  cd %s  range %s-%s  %s",key,st.sent,st.verified,st.unverified,st.cooldown and string.format("%.1f",st.cooldown) or "learning",
                 st.minRange and string.format("%.0f",st.minRange) or "?",st.maxRange and string.format("%.0f",st.maxRange) or "?",tostring(st.lastFail or st.lastEvidence or "")))
@@ -9070,6 +14439,9 @@ end
 
 -- ================= SETTINGS =================
 function U.buildSettings(page)
+    local _,dv=U.card(page,"Advanced","Research, diagnostics, raw settings and the capability matrix. Normal use never needs them.",{order=0})
+    U.toggle(dv,{label="Developer mode",desc="Show technical pages and details",get=function() return cfg().UI.DeveloperMode end,
+        set=function(v) local r=RAVYN:SetConfig("UI.DeveloperMode",v); if r and r.ok then task.defer(U.applyDevMode) end; return r end})
     local _,i=U.card(page,"Interface","",{order=1})
     U.toggle(i,{label="Remember settings",desc="Saved locally through executor file APIs",get=function() return cfg().UI.RememberSettings end,set=setc("UI.RememberSettings")})
     U.toggle(i,{label="Reduce motion",desc="Instant state changes, no tweens",get=function() return cfg().UI.ReducedMotion end,set=setc("UI.ReducedMotion")})
@@ -9079,9 +14451,16 @@ function U.buildSettings(page)
     local _,w=U.card(page,"World","",{order=2})
     U.segment(w,{{"Walk",16},{"Swift",22},{"Fast",28}},function() local v=cfg().Movement.Speed; if v<=17 then return 16 elseif v<=23 then return 22 end; return 28 end,
         function(v) local r=RAVYN:SetConfig("Movement.Speed",v); if r.ok then RAVYN:SetConfig("Movement.SpeedEnabled",v~=16) end; return r end)
-    U.toggle(w,{label="NPC ESP",get=function() return cfg().Intelligence.ESP.NPC end,set=function(v) return RAVYN:SetESP("NPC",v) end})
-    U.toggle(w,{label="Boss ESP",get=function() return cfg().Intelligence.ESP.Boss end,set=function(v) return RAVYN:SetESP("Boss",v) end})
+    U.toggle(w,{label="Mob ESP",desc="More layers on the Visuals page",get=function() return cfg().Visuals and cfg().Visuals.Mobs end,set=function(v) return RAVYN:SetVisual("Mobs",v) end})
+    U.toggle(w,{label="Boss ESP",get=function() return cfg().Visuals and cfg().Visuals.Bosses end,set=function(v) return RAVYN:SetVisual("Bosses",v) end})
     U.toggle(w,{label="Anti-AFK",get=function() return cfg().Intelligence.AntiAFK end,set=function(v) return RAVYN:SetAntiAFK(v) end})
+    local _,kb=U.card(page,"Keyboard shortcuts","",{order=3})
+    local shortcuts={{"Ctrl + K","Open command palette"},{"/ (slash)","Open command palette"},{"Right Ctrl","Toggle hide / show"},{"Type in sidebar","Filter page list"}}
+    for _,s in ipairs(shortcuts) do
+        local row=U.n("Frame",kb,{Size=UDim2.new(1,0,0,28),BackgroundTransparency=1})
+        local badge=U.n("TextButton",row,{Size=UDim2.fromOffset(86,22),Position=UDim2.fromOffset(0,3),BackgroundColor3=C.card,Text=s[1],TextColor3=C.sub,TextSize=11,Font=U.F.mono,AutoButtonColor=false,BorderSizePixel=0}); U.round(badge,6); U.stroke(badge,C.line,1,.3)
+        U.label(row,s[2],12,C.sub,U.F.body,{Size=UDim2.new(1,-96,1,0),Position=UDim2.fromOffset(96,0),TextWrapped=false})
+    end
 end
 return true]==========]); if not ok then return end end
 do local ok=runChunk("UI384_PagesC.lua",[==========[local G=(getgenv and getgenv()) or _G
@@ -9094,49 +14473,48 @@ local C=U.C
 local function statusColor(s) return (s=="VERIFIED" and C.green) or (s=="PARTIAL" and C.orange) or (s=="DISABLED" and C.gray) or C.faint end
 function U.buildResearch(page)
     local PR=RAVYN.Probe; local GK=RAVYN.GameKnowledge
-    -- Learn Action
-    local _,la=U.card(page,"Learn action","Pick what you are about to do, press Start, do it once by hand in the game, then press Stop. RAVYN records what changed and which prompt/button/key you used. Evidence only — nothing becomes verified automatically.",{order=1})
-    local selected={PR and PR.presets[1][1] or "Custom action",PR and PR.presets[1][2] or "OTHER"}
-    local grid=U.n("Frame",la,{Size=UDim2.new(1,0,0,0),AutomaticSize=Enum.AutomaticSize.Y,BackgroundTransparency=1})
-    U.n("UIGridLayout",grid,{CellSize=UDim2.new(.333,-6,0,30),CellPadding=UDim2.fromOffset(6,6),SortOrder=Enum.SortOrder.LayoutOrder})
-    local chips={}
-    for i,p in ipairs(PR and PR.presets or {}) do
-        local b=U.n("TextButton",grid,{BackgroundColor3=C.card,Text=p[1],TextColor3=C.sub,TextSize=11,Font=U.F.semi,AutoButtonColor=false,BorderSizePixel=0,LayoutOrder=i,TextTruncate=Enum.TextTruncate.AtEnd})
-        U.round(b,8); chips[i]={b=b,p=p}
-        table.insert(RAVYN._connections,b.Activated:Connect(function() if PR.recording then U.toast("Stop the current recording first","warn"); return end; selected={p[1],p[2]} end))
-    end
-    U.addRefresh(function()
-        for _,c in ipairs(chips) do
-            local on=c.p[1]==selected[1]
-            U.setColor(c.b,"BackgroundColor3",on and C.goldDim or C.card); U.setColor(c.b,"TextColor3",on and C.gold or C.sub)
-        end
-    end)
-    U.kv(la,"Selected",function() return selected[1].."  ·  "..selected[2],C.text end)
-    local rec=U.button(la,"Start recording",function()
-        if PR.recording then return RAVYN:LearnActionEnd() end
-        return RAVYN:LearnActionBegin(selected[1],selected[2])
+    -- deep link from other pages (e.g. Quests → Research Crow)
+    function U.openResearch() if U.show then U.show("Research") end end
+    -- v3.9.1 UniversalTrace: one button replaces the per-system presets
+    local TR=RAVYN.Trace; local FR=RAVYN.FeatureRegistry
+    local _,la=U.card(page,"Learning","Press Start, play normally (accept a quest, open a menu, train, loot…), then Stop. RAVYN groups every action with what it changed and proposes candidate meanings. Nothing becomes verified automatically.",{order=1})
+    local rec=U.button(la,"START LEARNING",function()
+        if TR and TR.active then return RAVYN:StopLearning() end
+        return RAVYN:StartLearning()
     end,"accent")
     U.addRefresh(function()
-        if PR.recording then U.setText(rec,string.format("Stop recording · %s · %.0fs",PR.recording.label,os.clock()-PR.recording.at)); U.setColor(rec,"TextColor3",C.red)
-        else U.setText(rec,"Start recording"); U.setColor(rec,"TextColor3",C.gold) end
+        if TR and TR.active then U.setText(rec,string.format("STOP LEARNING · %ds · %d events",math.floor(os.clock()-TR.startedAt),#TR.events)); U.setColor(rec,"TextColor3",C.red)
+        else U.setText(rec,"START LEARNING"); U.setColor(rec,"TextColor3",C.gold) end
     end)
-    U.kv(la,"Last evidence",function()
-        local r=PR and PR.records[#PR.records]; if not r then return "none yet",C.gray end
-        return r.actionName.." · "..r.confidence..(r.file and " · saved to RAVYN/Probes" or ""),(r.confidence=="HIGH" and C.green) or (r.confidence=="MEDIUM" and C.orange) or C.sub end)
-    U.kv(la,"Interaction",function()
-        local r=PR and PR.records[#PR.records]; if not r then return "—",C.gray end; return r.interactionCandidate,C.text end)
-    U.kv(la,"Changes",function()
-        local r=PR and PR.records[#PR.records]; if not r then return "—",C.gray end
-        return string.format("GUI %d · world %d · values %d",r.guiChanges,r.worldChanges,r.valueChanges),C.sub end)
-    U.button(la,"Copy last evidence",function() return RAVYN:CopyLearnActionReport() end)
+    U.kv(la,"Last trace",function() if not (TR and TR.last) then return "none yet",C.gray end
+        return string.format("%d events · %d actions · %d candidates%s",#TR.events,#TR.groups,#TR.candidates,TR.saved and " · saved to RAVYN/Traces" or ""),C.green end)
+    U.kv(la,"Top candidate",function() local c=TR and TR.candidates and TR.candidates[1]; if not c then return "—",C.gray end; return "["..c.confidence.."] "..c.text,C.text end)
+    U.button(la,"Copy trace report",function() return RAVYN:CopyTraceReport() end)
+    -- Feature registry: DATA / ACTION / VERIFY
+    local _,fr=U.card(page,"Features","Identity · Presence · Action · Verify, kept separate. Presence is what is streamed now; it never lowers identity.",{order=2})
+    local short={VERIFIED="✓",CANDIDATE="?",PARTIAL="~",UNRESOLVED="✗",NOT_FOUND_IN_CONTEXT="–",LOCAL="L",["N/A"]="·",PRESENT="●",NOT_STREAMED="○",NOT_CHECKED="…"}
+    local function col(st) return (st=="VERIFIED" and C.green) or (st=="CANDIDATE" and C.gold) or (st=="PARTIAL" and C.orange) or (st=="LOCAL" and C.cyan) or C.faint end
+    for _,k in ipairs(FR and FR.order or {}) do
+        U.kv(fr,FR.features[k].title,function()
+            local f=FR.features[k]
+            local worst=(f.action=="UNRESOLVED" or f.action=="NOT_FOUND_IN_CONTEXT") and f.action or f.verify
+            return string.format("I %s  ·  P %s  ·  A %s  ·  V %s",short[f.identity] or "?",short[f.presence] or "?",short[f.action] or "?",short[f.verify] or "?"),(f.identity=="VERIFIED" and col(worst)) or col(f.identity)
+        end)
+    end
+    U.label(fr,"✓ verified · ? candidate · ~ partial · ✗ unresolved · – not found here · L local · ● present · ○ not streamed · … not checked",11,C.sub,U.F.body)
+    U.button(fr,"Refresh runtime schema",function() if FR then FR.refresh(true) end; return RAVYN:GetRuntimeSchemaReport() end,"accent")
+    U.button(fr,"Copy discovery report",function() return RAVYN:CopyDiscoveryReport() end)
+    -- Capabilities (same provider as Auto Play / Quests / Diagnostics)
+    local _,cp=U.card(page,"Capabilities","Single source of truth. Raised to VERIFIED only by live evidence.",{order=3,collapsible=true,collapsed=true})
+    for _,k in ipairs(GK and GK.capOrder or {}) do U.capRow(cp,k) end
     -- Game systems
-    local _,gs=U.card(page,"Game systems","What RAVYN understands about each Slayers 2 activity. REFERENCE facts come from guides and are never used as bindings.",{order=2})
+    local _,gs=U.card(page,"Game systems","What RAVYN understands about each Slayers 2 activity. REFERENCE facts come from guides and are never used as bindings.",{order=4,collapsible=true,collapsed=true})
     for _,k in ipairs(GK and GK.order or {}) do
         U.kv(gs,GK.systems[k].title,function()
             local s=GK.systems[k]; return s.status..(s.evidence>0 and ("  ·  "..s.evidence.." evidence") or ""),statusColor(s.status) end)
     end
     -- Player progress + world
-    local _,pp=U.card(page,"Player progress","Verified reads only. Unknown values stay unresolved; possible data fields are listed as candidates.",{order=3,collapsible=true})
+    local _,pp=U.card(page,"Player progress","Verified reads only. Unknown values stay unresolved; possible data fields are listed as candidates.",{order=5,collapsible=true,collapsed=true})
     local lastRead=-math.huge
     U.kv(pp,"Level",function() local now=os.clock(); if now-lastRead>2 and GK then GK.readProgress(); GK.readWorld(); lastRead=now end
         local P=GK and GK.progress or {}; return P.level and tostring(P.level) or "UNRESOLVED",P.level and C.green or C.gray end)
@@ -9148,29 +14526,503 @@ function U.buildResearch(page)
     U.button(pp,"Copy research report",function() return RAVYN:CopyResearchReport() end,"accent")
 end
 return true]==========]); if not ok then return end end
+do local ok=runChunk("UI11_Pages.lua",[==========[local G=(getgenv and getgenv()) or _G
+local CTX=G.__RAVYN_CTX
+local RAVYN=CTX["RAVYN"]
+local LiveAction=CTX["LiveAction"]
+local result=CTX["result"]
+local U=CTX["UI384"]
+local C=U.C
+-- RAVYN DIRECT v1.1 · pages for the exploit core. Same primitives, same motion, FontScale 1.34 unchanged.
+local function cfg() return RAVYN.Config end
+local function setc(path) return function(v) return RAVYN:SetConfig(path,v) end end
+
+-- ================= shared state vocabulary =================
+local STATE_COLOR={OFF=C.gray,READY=C.sub,SEARCHING=C.cyan,TRAVELING=C.cyan,FIGHTING=C.green,LOOTING=C.gold,COOLDOWN=C.orange,
+    UNAVAILABLE=C.red,PARTIAL=C.orange,UNVERIFIED=C.orange,COMPLETE=C.green}
+function U.stateColor(s) return STATE_COLOR[s] or C.sub end
+local function stateText(s,detail) if detail and detail~="" then return s.."  ·  "..detail end; return s end
+-- Crow controller status → common vocabulary
+function U.crowState()
+    local CD=RAVYN.CrowDirect; if not CD then return "UNAVAILABLE","Crow controller missing" end
+    local on=cfg().CrowDirect and cfg().CrowDirect.Enabled
+    local GO=RAVYN.GoState; local goOn=GO and GO.active and not GO.paused and (GO.goal=="AUTO_PROGRESS" or GO.goal=="QUESTS")
+    if not on and not goOn then return "OFF","" end
+    local s=CD.status
+    local map={ACTIVE=nil,COOLDOWN="COOLDOWN",DAILY_COMPLETE="COOLDOWN",NO_HUNT_AVAILABLE="COOLDOWN",OPENING_CROW="SEARCHING",READING_HUNTS="SEARCHING",
+        ACCEPTING="SEARCHING",VERIFYING_ACCEPT="SEARCHING",TARGET_UNRESOLVED="SEARCHING",WAITING_LOOT="LOOTING",WAITING_COMBAT="FIGHTING",
+        CROW_TOOL_NOT_FOUND="UNAVAILABLE",OPEN_FAILED="UNAVAILABLE",ACCEPT_FAILED="UNAVAILABLE",READY="READY",STOPPED="READY"}
+    if s=="ACTIVE" then
+        local D=RAVYN.Direct; local st=(D and D.objective and D.state) or "FIGHTING"
+        return st,CD.detail or ""
+    end
+    if s=="DAILY_COMPLETE" then return "COOLDOWN","Daily missions complete" end
+    return map[s] or "SEARCHING",CD.detail or ""
+end
+function U.featureStates()
+    local D=RAVYN.Direct or {}; local BC=RAVYN.BossController or {}; local MZ=RAVYN.MuzanController or {}; local TC=RAVYN.TrainingController or {}
+    local V=RAVYN.Visuals or {}; local LC=RAVYN.LootController or {}
+    local lootOn=cfg().Loot384 and cfg().Loot384.AutoLootAfterKill
+    return {
+        {"Objective",D.state or "OFF",D.detail},
+        {"Crow hunts",U.crowState()},
+        {"Boss farm",BC.state or "OFF",BC.detail},
+        {"Auto loot",(LC.active and "LOOTING") or (lootOn and "READY" or "OFF"),LC.active and LC.state or (LC.lastResult~="—" and LC.lastResult or "")},
+        {"Muzan",MZ.state or "OFF",MZ.detail},
+        {"Training",TC.state or "READY",TC.detail},
+        {"Dungeon","UNAVAILABLE","Ouwigahara actions not mapped yet"},
+        {"Visuals",V.state or "OFF",V.count and V.count>0 and (V.count.." tracked") or ""},
+        {"Combat input",U.combatInputState()},
+    }
+end
+-- v1.2.2: one line for the combat input engine (mode + whether an attack can actually execute)
+function U.combatInputState()
+    local Bx=RAVYN.CombatActionBus; if not Bx then return "UNAVAILABLE","combat bus missing" end
+    local m=Bx.mode(); local SAx=RAVYN.SilentActionAdapter
+    local atk=SAx and SAx.capStatus("ATTACK") or "UNAVAILABLE"
+    if m=="SILENT" then
+        if atk=="VERIFIED_SILENT" then return "READY","SILENT · attack verified" end
+        return "PARTIAL","SILENT · no verified attack · nothing executes until verified"
+    end
+    if m=="HYBRID" then return "PARTIAL","HYBRID · silent first, labelled legacy input for the rest" end
+    return "UNVERIFIED","LEGACY_INPUT · key / mouse simulation"
+end
+local function stateRow(parent,title,fn)
+    return U.kv(parent,title,function(S) local s,d=fn(S); return stateText(s,d),U.stateColor(s) end,{size=13})
+end
+U.stateRow=stateRow
+
+-- ================= HOME: systems overview =================
+local baseHome=U.buildHome
+function U.buildHome(page)
+    baseHome(page)
+    local _,sys=U.card(page,"Systems","Each feature reports what it is doing right now.",{order=5,collapsible=true})
+    for i=1,9 do
+        stateRow(sys,({"Objective","Crow hunts","Boss farm","Auto loot","Muzan","Training","Dungeon","Visuals","Combat input"})[i],function()
+            local row=U.featureStates()[i]; return row[2],row[3] end)
+    end
+end
+
+-- ================= BOSS =================
+function U.buildBoss(page)
+    local BC=RAVYN.BossController
+    local bf=function() return cfg().BossFarm end
+    local _,b=U.card(page,"Boss farm","Pick bosses, RAVYN teleports, fights, loots the chest, then moves to the next one.",{order=0,
+        warn=function() return (BC and BC.state=="UNAVAILABLE") and C.orange or nil end})
+    U.toggle(b,{label="Boss farm",desc="Direct teleport → Combat Hover → loot → next boss",get=function() return bf().Enabled end,set=function(v) return RAVYN:SetBossFarm(v) end,
+        status=function() local s=BC and BC.state or "OFF"; return s,U.stateColor(s) end})
+    U.toggle(b,{label="Rotation",desc="Cycle your selection in order after each kill",get=function() return bf().Rotation end,set=setc("BossFarm.Rotation")})
+    U.toggle(b,{label="Skip respawning bosses",desc="A boss killed in the last 45 s is skipped",get=function() return bf().SkipRespawning end,set=setc("BossFarm.SkipRespawning")})
+    U.toggle(b,{label="Travel to remembered bosses",desc="Teleport to a selected boss's last seen spot when it is not streamed",get=function() return bf().TravelToRemembered end,set=setc("BossFarm.TravelToRemembered")})
+    U.kv(b,"Current boss",function()
+        if not (BC and BC.choice) then return (BC and BC.detail~="" and BC.detail) or "—",C.gray end
+        for _,x in ipairs(BC.list) do if x.name==BC.choice.name then
+            return "◆ "..x.name..(x.hpPct and string.format("  ·  %d%%",math.floor(x.hpPct+.5)) or "")..(x.distance and string.format("  ·  %.0f studs",x.distance) or ""),C.gold end end
+        return "◆ "..BC.choice.name,C.gold end,{size=14})
+    U.bar(b,function() if BC and BC.choice then for _,x in ipairs(BC.list) do if x.name==BC.choice.name and x.hpPct then return x.hpPct/100,U.hpColor(x.hpPct) end end end; return 0,C.gray end,8)
+    U.kv(b,"Chest",function() if not (BC and BC.choice) then return "—",C.gray end
+        for _,x in ipairs(BC.list) do if x.name==BC.choice.name then return (x.chest or "unknown")..(x.onlyAtNight and "  ·  night only" or ""),x.chest and C.text or C.gray end end
+        return "—",C.gray end)
+    U.kv(b,"Bosses defeated",function() return tostring(BC and BC.kills or 0).." this session",C.sub end)
+    U.kv(b,"After death",function() local r=BC and BC.lastRespawn; if not r then return cfg().TravelController.ReturnToBossOnRespawn and "Return to the same boss" or "Off",C.sub end
+        return tostring(r.result).."  ·  "..tostring(r.boss or ""),(r.result=="TELEPORTED" or r.result=="SENT") and C.green or C.sub end)
+    local _,l=U.card(page,"Bosses","Tap to select. No selection = nearest eligible boss. Selected bosses rotate in the order you pick them.",{order=1})
+    local rows={}
+    for i=1,12 do
+        local r=U.n("TextButton",l,{Size=UDim2.new(1,0,0,40),BackgroundColor3=C.card,Text="",AutoButtonColor=false,BorderSizePixel=0,Visible=false}); U.round(r,10)
+        local mark=U.label(r,"",14,C.gold,U.F.bold,{Size=UDim2.fromOffset(26,40),Position=UDim2.fromOffset(12,0),TextWrapped=false})
+        local nm=U.label(r,"",13,C.text,U.F.semi,{Size=UDim2.new(1,-300,1,0),Position=UDim2.fromOffset(40,0),TextWrapped=false,TextTruncate=Enum.TextTruncate.AtEnd})
+        local st=U.label(r,"",11,C.sub,U.F.bold,{Size=UDim2.fromOffset(250,40),Position=UDim2.new(1,-262,0,0),TextXAlignment=Enum.TextXAlignment.Right,TextWrapped=false,TextTruncate=Enum.TextTruncate.AtEnd})
+        U.pressable(r,{hoverScale=1.006,pressScale=.985,enterColor=C.raised,leaveColor=C.card})
+        table.insert(RAVYN._connections,r.Activated:Connect(function()
+            local name=r:GetAttribute("boss"); if not name then return end
+            U.report(RAVYN:ToggleBossSelected(name),name)
+        end))
+        rows[i]={r=r,mark=mark,nm=nm,st=st}
+    end
+    local empty=U.label(l,"No boss seen yet · bosses appear here once streamed or known from Boss Hunts",12,C.sub,U.F.body)
+    U.addRefresh(function()
+        local list=(BC and BC.list) or {}
+        empty.Visible=#list==0
+        for i,row in ipairs(rows) do
+            local x=list[i]; row.r.Visible=x~=nil
+            if x then
+                row.r:SetAttribute("boss",x.name)
+                U.setText(row.mark,x.selected and "✓" or "·"); U.setColor(row.mark,"TextColor3",x.selected and C.gold or C.faint)
+                U.setText(row.nm,x.name..(x.onlyAtNight and "  ☾" or ""))
+                local stTxt=(x.status=="ALIVE" and ((x.hpPct and string.format("ALIVE · %d%%",math.floor(x.hpPct+.5)) or "ALIVE")..(x.distance and string.format(" · %.0f studs",x.distance) or "")))
+                    or (x.status=="SKIPPED" and ("SKIPPED · "..tostring(x.reason))) or (x.status=="NOT_STREAMED" and "NOT STREAMED · last spot known")
+                    or (x.status=="UNKNOWN_LOCATION" and "NOT STREAMED") or (x.status=="RESPAWNING" and "RESPAWNING") or (x.status=="UNAVAILABLE" and "UNAVAILABLE") or x.status
+                U.setText(row.st,stTxt)
+                U.setColor(row.st,"TextColor3",(x.status=="ALIVE" and C.green) or (x.status=="RESPAWNING" and C.orange) or ((x.status=="SKIPPED" or x.status=="UNAVAILABLE") and C.red) or C.faint)
+            end
+        end
+    end)
+    U.button(l,"Clear selection",function() return RAVYN:ClearBossSelection() end)
+    if U.buildFarm then U.buildFarm(page) end
+end
+
+-- ================= QUESTS: objective + Muzan =================
+local baseQuests=U.buildQuests
+function U.buildQuests(page)
+    local D=RAVYN.Direct
+    local _,o=U.card(page,"Objective","Read from your own quest data. RAVYN teleports to the target, fights it, loots, then takes the next one.",{order=-1})
+    stateRow(o,"Status",function() return D and D.state or "OFF",D and D.detail end)
+    U.kv(o,"Target",function() local ob=D and D.objective; if not ob then return "—",C.gray end
+        return ob.name..(ob.boss and "  ◆" or ""),ob.streamed and C.text or C.cyan end,{size=14})
+    U.kv(o,"Source",function() local ob=D and D.objective; return ob and ob.source or "—",ob and C.purple or C.gray end)
+    U.kv(o,"Progress",function() local ob=D and D.objective; if ob and ob.progress then return string.format("%d / %d",ob.progress,ob.required or 0),C.purple end; return "—",C.gray end)
+    U.bar(o,function() local ob=D and D.objective; if ob and ob.progress and ob.required and ob.required>0 then return ob.progress/ob.required,C.purple end; return 0,C.purple end)
+    U.kv(o,"Quest data",function() if not D then return "—",C.gray end
+        if D.questError then return "Unavailable · "..tostring(D.questError),C.orange end
+        return tostring(#D.quests).." active",C.sub end)
+    U.toggle(o,{label="Follow quest objective",desc="Active quest target drives targeting during Auto Play",get=function() return cfg().Direct.FollowQuestData end,set=setc("Direct.FollowQuestData")})
+    baseQuests(page)
+    local MZ=RAVYN.MuzanController
+    local mz=function() return cfg().MuzanDirect end
+    local _,m=U.card(page,"Muzan","Find → teleport → open dialogue → fight the task target. Task selection is not mapped yet, so you choose it.",{order=4})
+    U.toggle(m,{label="Muzan",desc="Track Muzan and handle his task objectives",get=function() return mz().Enabled end,set=function(v) return RAVYN:SetMuzan("Enabled",v) end,
+        status=function() local s=MZ and MZ.state or "OFF"; return s,U.stateColor(s) end})
+    U.toggle(m,{label="Auto open dialogue",desc="Fires Muzan's own prompt once, verified by his dialogue appearing",get=function() return mz().AutoInteract end,set=function(v) return RAVYN:SetMuzan("AutoInteract",v) end,
+        dep=function() return mz().Enabled end,depText="Enable Muzan first"})
+    U.kv(m,"Now",function() return (MZ and MZ.detail~="" and MZ.detail) or "—",C.sub end)
+    for _,x in ipairs({{"find","Find Muzan"},{"teleport","Teleport"},{"interact","Open dialogue"},{"accept","Choose task"},{"objective","Task objective"},{"repeatTask","Repeat"}}) do
+        stateRow(m,x[2],function() local s=MZ and MZ.sub[x[1]] or "UNAVAILABLE"
+            local why=(s=="UNAVAILABLE" and (x[1]=="accept" or x[1]=="repeatTask")) and "needs a verified task-menu binding" or ((s=="PARTIAL") and "works, verification limited" or "")
+            return s,why end)
+    end
+    local dl=U.label(m,"",11,C.sub,U.F.body,{AutomaticSize=Enum.AutomaticSize.Y,Size=UDim2.new(1,0,0,0)})
+    U.addRefresh(function() local t=MZ and MZ.dialogue or {}; dl.Visible=#t>0; if #t>0 then U.setText(dl,"Dialogue: "..table.concat(t,"  ·  ")) end end)
+    U.button(m,"Teleport to Muzan",function() return RAVYN:TeleportToMuzan() end,"accent")
+end
+
+-- ================= TRAINING =================
+function U.buildTraining(page)
+    local TC=RAVYN.TrainingController
+    local _,b=U.card(page,"Breathing","Your style is read from your hotbar and your own player data — never assumed.",{order=1})
+    local detectAt=-math.huge
+    U.kv(b,"Detected style",function()
+        local now=os.clock(); if now-detectAt>5 then detectAt=now; pcall(TC.detect) end
+        return TC.detected and (TC.detected.." Breathing") or "Not visible",TC.detected and C.gold or C.gray end,{size=14})
+    U.kv(b,"Detected from",function() return tostring(TC.detectedFrom or "—"),C.sub end)
+    U.label(b,"Trainer",12,C.sub,U.F.semi)
+    local T=TC.TRAINERS
+    U.segment(b,{T[1],T[2],T[3],T[4]},function() return cfg().TrainingDirect.SelectedStyle end,function(v) return RAVYN:SetTrainingStyle(v) end)
+    U.segment(b,{T[5],T[6],T[7],T[8]},function() return cfg().TrainingDirect.SelectedStyle end,function(v) return RAVYN:SetTrainingStyle(v) end)
+    U.kv(b,"Trainer location",function()
+        local st=cfg().TrainingDirect.SelectedStyle; if st=="" then return "Pick a trainer",C.gray end
+        local rec=TC.trainers[st]
+        if not TC.scannedAt then return "Not scanned yet",C.gray end
+        if rec and rec.pos then return "Streamed",C.green end
+        if rec and rec.identity then return "Known · not streamed here",C.orange end
+        return "Not found",C.red end)
+    stateRow(b,"Status",function() return TC.state or "READY",TC.detail end)
+    U.button(b,"Teleport to trainer",function() return RAVYN:TeleportToTrainer() end,"accent")
+    U.button(b,"Scan trainers & stations",function() TC.scan(); return result(true,"SCANNED") end)
+    local _,s=U.card(page,"Stations","Workspace training stations and their prompts. You play the minigame; RAVYN takes you there and can start it.",{order=2})
+    local rows={}
+    for i=1,8 do
+        local r=U.n("Frame",s,{Size=UDim2.new(1,0,0,40),BackgroundColor3=C.card,BorderSizePixel=0,Visible=false}); U.round(r,10)
+        local nm=U.label(r,"",13,C.text,U.F.semi,{Size=UDim2.new(1,-220,1,0),Position=UDim2.fromOffset(12,0),TextWrapped=false,TextTruncate=Enum.TextTruncate.AtEnd})
+        local go=U.n("TextButton",r,{Size=UDim2.fromOffset(92,30),Position=UDim2.new(1,-200,.5,-15),BackgroundColor3=C.raised,Text="Go",TextColor3=C.text,TextSize=12,Font=U.F.semi,AutoButtonColor=false,BorderSizePixel=0}); U.round(go,8)
+        local start=U.n("TextButton",r,{Size=UDim2.fromOffset(92,30),Position=UDim2.new(1,-100,.5,-15),BackgroundColor3=C.goldDim,Text="Start",TextColor3=C.gold,TextSize=12,Font=U.F.semi,AutoButtonColor=false,BorderSizePixel=0}); U.round(start,8)
+        U.pressable(go,{hoverScale=1.03,pressScale=.95}); U.pressable(start,{hoverScale=1.03,pressScale=.95})
+        table.insert(RAVYN._connections,go.Activated:Connect(function() U.report(RAVYN:TeleportToStation(i),"Station") end))
+        table.insert(RAVYN._connections,start.Activated:Connect(function() U.report(RAVYN:InteractTrainingStation(i),"Station started") end))
+        rows[i]={r=r,nm=nm,start=start}
+    end
+    local none=U.label(s,"Press Scan to list stations",12,C.sub,U.F.body)
+    U.addRefresh(function()
+        if not TC.scannedAt then pcall(TC.scan) end
+        local list=TC.stations or {}
+        none.Visible=#list==0; if #list==0 and TC.scannedAt then U.setText(none,"No Workspace.Training stations streamed here") end
+        for i,row in ipairs(rows) do
+            local x=list[i]; row.r.Visible=x~=nil
+            if x then U.setText(row.nm,x.name..(x.action and ("  ·  "..x.action) or "")); row.start.Visible=x.prompt~=nil end
+        end
+    end)
+    local _,sa=U.card(page,"Sub-actions","",{order=3})
+    for _,x in ipairs({{"select","Trainer selection","ready"},{"teleport","Trainer / station teleport","direct teleport"},{"interact","Start station","fires its prompt once"},
+        {"minigame","Minigame","no verified input logic"},{"progress","Progress","local quest data"}}) do
+        stateRow(sa,x[2],function() return TC.sub[x[1]] or "UNAVAILABLE",x[3] end)
+    end
+    local _,p=U.card(page,"Progress","Your local quest data and mastery entries.",{order=4,collapsible=true})
+    local ql=U.label(p,"",12,C.sub,U.F.body,{AutomaticSize=Enum.AutomaticSize.Y,Size=UDim2.new(1,0,0,0)})
+    local ml=U.label(p,"",11,C.faint,U.F.mono,{AutomaticSize=Enum.AutomaticSize.Y,Size=UDim2.new(1,0,0,0)})
+    U.addRefresh(function()
+        local D=RAVYN.Direct; local lines={}
+        for _,q in ipairs((D and D.quests) or {}) do table.insert(lines,q.quest..(q.progress and string.format("  ·  %d/%d",q.progress,q.required or 0) or "")) end
+        U.setText(ql,#lines>0 and table.concat(lines,"\n") or "No active quest")
+        local m=TC.readMastery(); local ml2={}
+        if m and m.rows then for i,r in ipairs(m.rows) do if i>8 then break end; table.insert(ml2,r.name.."  "..r.value) end end
+        U.setText(ml,(#ml2>0 and ("Mastery\n"..table.concat(ml2,"\n"))) or ((m and m.error) and ("Mastery: "..tostring(m.error))) or "Mastery: no entries")
+    end)
+end
+
+-- ================= DUNGEON =================
+function U.buildDungeon(page)
+    local DG=RAVYN.DungeonController; local R=DG.reader or {}
+    local _,m=U.card(page,"Dungeon mode","Reads the Ouwigahara HUD once found: Floor, Points, Enemies remaining, Rerolls and the card choice.",{order=0})
+    U.toggle(m,{label="Dungeon mode",desc="Search your screen once for the dungeon HUD, then read only that",get=function() return cfg().Ouwi11.Enabled end,set=function(v) return RAVYN:SetDungeonMode(v) end,
+        status=function() local s=R.status or "OFF"; return s,U.stateColor(s) end})
+    U.kv(m,"HUD",function() return R.rootPath and "Found" or (cfg().Ouwi11.Enabled and "Searching…" or "—"),R.rootPath and C.green or C.gray end)
+    U.kv(m,"Floor",function() return R.floor and tostring(R.floor) or (R.hits and R.hits.floor) or "—",R.floor and C.text or C.gray end,{size=14})
+    U.kv(m,"Points",function() return R.points and tostring(R.points) or (R.hits and R.hits.points) or "—",R.points and C.gold or C.gray end)
+    U.kv(m,"Enemies remaining",function() return R.enemies and tostring(R.enemies) or (R.hits and R.hits.enemies) or "—",R.enemies and C.text or C.gray end)
+    U.kv(m,"Rerolls",function() return R.rerolls and tostring(R.rerolls) or (R.hits and R.hits.rerolls) or "—",R.rerolls and C.text or C.gray end)
+    U.kv(m,"Run state",function() if not cfg().Ouwi11.Enabled then return "OFF",C.gray end; return R.rootPath and "IN RUN (HUD visible)" or "NOT DETECTED",R.rootPath and C.green or C.gray end)
+    local cl=U.label(m,"",11,C.sub,U.F.mono,{AutomaticSize=Enum.AutomaticSize.Y,Size=UDim2.new(1,0,0,0)})
+    U.addRefresh(function()
+        local rk=R.ranked or {}
+        cl.Visible=#rk>0
+        if #rk>0 then local lines={"Cards on screen (ranked):"}; for i,x in ipairs(rk) do table.insert(lines,string.format("%d  %-18s %s",i,x.name,x.score==-math.huge and "BLACKLISTED" or x.reason)) end; U.setText(cl,table.concat(lines,"\n")) end
+    end)
+    U.kv(m,"Last card picked",function() return R.lastPick or "—",R.lastPick and C.green or C.gray end)
+    U.button(m,"Re-scan for dungeon HUD",function() return RAVYN:RediscoverDungeonHud() end)
+    local _,d=U.card(page,"Ouwigahara automation","Steps without a verified game action stay locked instead of pretending.",{order=1})
+    for _,s in ipairs(DG.sub) do
+        U.toggle(d,{label=s.label,desc=s.why,get=function() return cfg().Ouwi11[s.key] end,set=function(v) return RAVYN:SetDungeonOption(s.key,v) end,
+            dep=function() return s.status~="UNAVAILABLE" and s.status~="UNVERIFIED" end,depText=s.label.." needs a verified game action first",
+            status=function() local st=DG.status(s.key); if s.status=="UNVERIFIED" then st="UNVERIFIED" end; return st,U.stateColor(st) end})
+    end
+    local _,c=U.card(page,"Card preferences","The ranking engine applies these to whatever cards the reader finds.",{order=3})
+    local dc=function() return cfg().Dungeon end
+    U.kv(c,"Blacklist",function() return table.concat(dc().Blacklist or {},", "),C.red end)
+    U.kv(c,"Priority",function() return table.concat(dc().PriorityOrder or {},", "),C.green end)
+    U.kv(c,"Low priority",function() return table.concat(dc().LowPriority or {},", "),C.orange end)
+end
+
+-- ================= LOOT: boss loot V2 =================
+local baseLoot=U.buildLoot
+function U.buildLoot(page)
+    baseLoot(page)
+    local B=RAVYN.BossLootV2
+    local _,b=U.card(page,"Boss chest & drops","Boss dies → chest prompt → its key → drops → each drop's key → verified by your chest counter and inventory.",{order=0})
+    U.toggle(b,{label="Boss loot V2",desc="Uses the key the game's own prompt shows (T)",get=function() return cfg().BossLootV2.Enabled end,set=setc("BossLootV2.Enabled"),
+        status=function(S) local st=(S.loot.active and RAVYN.LootController.v2Active) and "LOOTING" or (cfg().BossLootV2.Enabled and "READY" or "OFF"); return st,U.stateColor(st) end})
+    U.kv(b,"Step",function() return B and B.phase or "IDLE",(B and B.phase~="IDLE") and C.gold or C.gray end)
+    U.kv(b,"Chests opened",function() local c=B and B.chestsCounter and B.chestsCounter(); return tostring(B and B.stats.chestsOpened or 0).." this session"..(c and ("  ·  total "..c) or ""),C.sub end)
+    U.kv(b,"Verified by",function() return tostring(B and B.verifiedBy or "—"),C.sub end)
+    U.kv(b,"Items collected",function() return tostring(B and B.stats.items or 0)..((B and B.stats.unverified>0) and ("  ·  "..B.stats.unverified.." unverified") or ""),C.green end)
+    U.kv(b,"Last loot",function() local l=B and B.lastItems or {}; return #l>0 and table.concat(l,", ") or "—",#l>0 and C.text or C.gray end)
+end
+
+-- ================= COMBAT: Input engine (v1.2.2 silent combat) + Insta Kill (hardened) =================
+U.MSG.FINISHER_LOCK={"Finisher","Normal combat paused for one finishing action and its verification.","gold"}
+U.MSG.SILENT_UNAVAILABLE={"Silent action unavailable","SILENT mode: this action has no verified local game action. Nothing is sent. Verify silent bindings, or use HYBRID.","orange"}
+U.MSG.THRESHOLD_FINISHER_SILENT_UNAVAILABLE={"Silent finisher unavailable","No verified local attack/skill action for the finisher. Normal combat continues.","orange"}
+U.MSG.SILENT_VERIFY_RUNNING={"Verifying silent bindings","Combat actions pause while each local action is tested once.","cyan"}
+U.MSG.LEGACY_BLOCKED_IN_SILENT={"Legacy input blocked","SILENT mode never falls back to key or mouse simulation.","orange"}
+U.MSG.PHYSICAL_INPUT_BLOCKED={"Input blocked","A combat key/click did not come through the combat bus and was blocked.","red"}
+U.MSG.PLAYER_STUNNED={"Stunned","Your character cannot act right now.","gold"}
+U.MSG.GUARD_HELD={"Guarding","Attacks wait until the guard is released.","gold"}
+U.MSG.ACTION_FAILED={"Action failed","The local action could not be invoked; bindings are re-resolved.","orange"}
+U.MSG.COMBAT_BUS_UNAVAILABLE={"Combat bus missing","The CombatActionBus did not install.","red"}
+U.MSG.SKILL_NOT_READY={"Skill not ready","That skill is cooling down.","cyan"}
+U.MSG.GUARD_KEY_UNRESOLVED={"Guard key unknown","No guard key is resolved for legacy input.","orange"}
+local function capColor(s) return (s=="VERIFIED_SILENT" and C.green) or (s=="PARTIAL" and C.orange) or C.red end
+local function capText(s) return (s=="VERIFIED_SILENT" and "VERIFIED") or tostring(s) end
+local busCache,busAt=nil,-math.huge
+local function bus() local B=RAVYN.CombatActionBus; if not B then return nil end; local now=os.clock(); if now-busAt>.2 then busCache=B.status(); busAt=now end; return busCache end
+U.busStatus=bus
+local baseCombat=U.buildCombat
+function U.buildCombat(page)
+    baseCombat(page)
+    -- ---------- INPUT ENGINE ----------
+    local _,ie=U.card(page,"Input engine","Every combat action goes through one bus. SILENT runs only actions the game itself exposes on your client and never simulates a key or a click.",{order=0,
+        warn=function() local st=bus(); if not st then return C.red end; if st.mode=="SILENT" and st.physicalCombat>0 then return C.red end; if st.mode=="SILENT" and st.caps.ATTACK.status~="VERIFIED_SILENT" then return C.orange end; return nil end})
+    U.segment(ie,{{"Silent","SILENT"},{"Hybrid","HYBRID"},{"Legacy input","LEGACY_INPUT"}},function() return cfg().CombatInputMode end,function(v) return RAVYN:SetCombatInputMode(v) end)
+    U.kv(ie,"INPUT ENGINE",function() local m=cfg().CombatInputMode; return tostring(m),(m=="SILENT" and C.green) or (m=="HYBRID" and C.orange) or C.red end,{size=14})
+    for _,cap in ipairs({{"ATTACK","Attack"},{"SKILL","Skills"},{"GUARD","Guard"},{"DASH","Dash"},{"PARRY","Parry"}}) do
+        U.kv(ie,cap[2],function()
+            local st=bus(); local c=st and st.caps[cap[1]]
+            if not c then return "UNAVAILABLE",C.red end
+            local detail=(cap[1]=="SKILL") and c.reason or (c.binding or c.reason)
+            return capText(c.status).."  ·  "..tostring(detail),capColor(c.status) end)
+    end
+    U.kv(ie,"Current action",function()
+        local st=bus(); if not st then return "—",C.gray end
+        local a=st.current or st.last
+        if not a then return st.testing and "Silent test running" or "—",C.gray end
+        local state=st.current and "ACTION_LOCK" or (a.confirmed and "CONFIRMED" or (a.failed and "FAILED" or "UNCONFIRMED"))
+        return tostring(a.label).."  ·  "..tostring(a.displayLabel or a.backend).."  ·  "..state..(a.evidence and ("  ·  "..a.evidence) or ""),
+            (a.backend=="LEGACY_INPUT" and C.orange) or (state=="CONFIRMED" and C.green) or C.text end)
+    U.kv(ie,"Backend",function() local st=bus(); if not st then return "—",C.gray end; return st.backend,(st.mode=="SILENT" and C.green) or C.orange end)
+    U.kv(ie,"Physical inputs this fight",function()
+        local st=bus(); if not st then return "—",C.gray end
+        local n=st.physicalCombat
+        local txt=tostring(n).." combat"..(st.physicalOther>0 and ("  ·  "..st.physicalOther.." menu/loot") or "")..(st.blocked>0 and ("  ·  "..st.blocked.." blocked") or "")
+        return txt,(n>0 and st.mode=="SILENT" and C.red) or (n>0 and C.orange) or C.green end)
+    U.kv(ie,"Executed",function() local st=bus(); if not st then return "—",C.gray end
+        return string.format("%d silent  ·  %d legacy  ·  %d finisher",st.silentCount,st.legacyCount,st.finisherCount),C.sub end)
+    U.kv(ie,"Last refusal",function() local Bx=RAVYN.CombatActionBus; local r=Bx and Bx.lastCapReject
+        if not r then return "—",C.gray end
+        local e=U.explain(r.code); return (e and e.title or r.code).."  ·  "..tostring(r.kind),e and e.color or C.orange end)
+    U.kv(ie,"Silent test",function()
+        local st=bus(); if not st then return "—",C.gray end
+        if st.testing and st.test then return "Testing · "..tostring(st.test.step),C.cyan end
+        local t=st.lastTest; if not t then return "Not run yet",C.gray end
+        local pass,total=0,0; for _,x in ipairs(t.results or {}) do total=total+1; if x.pass then pass=pass+1 end end
+        return string.format("%d/%d actions verified",pass,total),pass>0 and C.green or C.orange end)
+    U.button(ie,"Verify silent bindings",function() return RAVYN:VerifySilentBindings() end,"accent")
+    U.button(ie,"Re-resolve local actions",function() return RAVYN:ResolveSilentBindings() end)
+    U.label(ie,"Stand next to a mob, then Verify: each local action found is triggered once through the game's own handler and becomes VERIFIED only if your character shows it (animation, damage counter, skill cooldown). SILENT never falls back to key/mouse input — if nothing is verified, nothing executes.",11,C.sub,U.F.body,{AutomaticSize=Enum.AutomaticSize.Y,Size=UDim2.new(1,0,0,0)})
+    -- ---------- INSTA KILL ----------
+    local IK=RAVYN.InstaKillAdapter; if not IK then return end
+    local ikCache,ikAt=nil,-math.huge
+    local st=function() local now=os.clock(); if now-ikAt>.2 then ikCache=IK.GetStatus(); ikAt=now end; return ikCache end
+    local _,k=U.card(page,"Insta Kill · Threshold 99%","Normal combat to ≤1% HP, then ONE finishing action, verified by death AND your credit. Auto uses it only after the full test matrix passes. No true one-hit path is used.",{order=2})
+    U.segment(k,{{"Auto","AUTO"},{"Threshold 99% · test","THRESHOLD_99"},{"Max burst","MAX_BURST"}},function() return cfg().InstaKill.Mode end,function(v) return RAVYN:SetInstaKillMode(v) end)
+    U.kv(k,"Status",function() local s=st(); local vs=s.verificationStatus
+        return s.statusText,(vs=="VERIFIED" and C.green) or (vs=="FAILED" and C.red) or (vs=="PROBATION" and C.cyan) or (vs=="TESTING" and C.gold) or C.gray end,{size=14})
+    U.kv(k,"In use",function() local s=st()
+        if s.activeClass=="THRESHOLD_99" and not s.available then return "THRESHOLD_99 selected · no executable finisher → normal combat",C.orange end
+        if s.activeClass=="THRESHOLD_99" then return "THRESHOLD_99 · finisher active"..(s.mode=="THRESHOLD_99" and s.verificationStatus~="VERIFIED" and " (testing)" or ""),C.gold end
+        if s.mode=="AUTO" and s.verificationStatus=="VERIFIED" and not s.backendCompatible then return "MAX BURST · verified with "..tostring(s.verifiedBackend).." only",C.orange end
+        return "MAX BURST"..(s.mode=="AUTO" and " · until VERIFIED" or ""),C.sub end)
+    U.kv(k,"Finisher",function() local s=st()
+        if not s.available then return tostring(s.finisherLabel),C.red end
+        return tostring(s.finisherLabel)..(s.finisherBackend=="LEGACY_INPUT" and "  ·  LEGACY" or ""),(s.finisherBackend=="SILENT_LOCAL") and C.green or C.orange end)
+    U.kv(k,"Now",function() local s=st(); local ph=s.phase
+        if ph=="IDLE" then
+            if s.activeClass=="THRESHOLD_99" and not s.available then return "Finisher unavailable · "..((cfg().CombatInputMode=="SILENT") and "no verified silent attack/skill" or "no finisher action"),C.orange end
+            return (s.blockReason and (U.explain(s.blockReason) or {}).title) or ((s.activeClass=="THRESHOLD_99") and ("Watching HP · pre-arm on"..(IK.armWhy and ("  ·  "..IK.armWhy) or "")) or "—"),s.blockReason and C.orange or C.sub end
+        return (ph=="ARMED" and "Finisher armed · combat paused") or "Verifying kill · nothing else sent",C.gold end)
+    U.kv(k,"Streak",function() local s=st(); return string.format("%d / %d in a row",s.consecutivePassed,s.testsRequired),s.consecutivePassed>0 and C.green or C.gray end)
+    U.bar(k,function() local s=st(); return s.consecutivePassed/math.max(1,s.testsRequired),(s.verificationStatus=="VERIFIED" and C.green) or C.gold end,6)
+    U.kv(k,"Normal mobs",function() local s=st(); return string.format("%d / %d",s.normalMobPassed,s.required.normal),s.normalMobPassed>=s.required.normal and C.green or C.sub end)
+    U.kv(k,"Bosses (different)",function() local s=st(); return string.format("%d / %d  ·  %d boss passes",s.bossDistinct,s.required.bosses,s.bossPassed),s.bossDistinct>=s.required.bosses and C.green or C.sub end)
+    U.kv(k,"High-HP boss",function() local s=st(); return string.format("%d / %d  ·  MaxHealth ≥ %s",s.highHpBossPassed,s.required.highHp,tostring(s.required.highHpMin)),s.highHpBossPassed>=s.required.highHp and C.green or C.sub end)
+    U.kv(k,"Results",function() local s=st()
+        return string.format("lethal %d · credit %d · misses %d · invalid %d · kill-only %d",s.lethalSuccesses,s.creditSuccesses,s.misses,s.invalidVerifications,s.killOnly),
+            (s.misses>0 or s.invalidVerifications>0) and C.orange or C.sub end)
+    U.kv(k,"Still needed",function() local s=st(); if s.verificationStatus=="VERIFIED" then return tostring(s.verifiedMatrix),C.green end
+        return (#s.missing>0) and table.concat(s.missing,", ") or "—",C.sub end)
+    U.kv(k,"Last test",function() local r=st().lastTest; if not r then return "—",C.gray end
+        local c=r.classification or "PENDING"
+        return tostring(r.target).." · "..c..string.format(" · HP %.1f%%",(r.hpBefore or 0)*100).." · "..tostring(r.trigger),
+            (c=="KILL_AND_CREDIT" and C.green) or (c=="INVALID_VERIFICATION" and C.orange) or C.red end)
+    U.label(k,"High-HP boss means MaxHealth at least",12,C.sub,U.F.semi)
+    U.segment(k,{{"5k",5000},{"10k",10000},{"25k",25000},{"50k",50000}},function() return cfg().InstaKill.HighHpBossMinMaxHealth end,function(v) return RAVYN:SetInstaKillHighHp(v) end)
+    U.button(k,"Reset verification",function() return RAVYN:ResetInstaKillVerification() end)
+end
+
+-- ================= DIAGNOSTICS: silent combat + Insta Kill test records =================
+local baseDiag=U.buildDiagnostics
+function U.buildDiagnostics(page)
+    baseDiag(page)
+    local _,sc=U.card(page,"Silent combat","ActionResolver candidates, what is listed but never invoked, the last silent test and every physical input RAVYN made.",{order=4})
+    local sbox=U.label(sc,"",11,C.sub,U.F.mono,{AutomaticSize=Enum.AutomaticSize.Y,Size=UDim2.new(1,0,0,0),TextYAlignment=Enum.TextYAlignment.Top})
+    U.addRefresh(function()
+        if U.activePage~="Diagnostics" then return end
+        local B=RAVYN.CombatActionBus; local SA=RAVYN.SilentActionAdapter; local A=RAVYN.InputAudit
+        if not (B and SA and A) then U.setText(sbox,"combat bus not installed"); return end
+        local st=B.status(); local lines={}
+        table.insert(lines,"mode "..st.mode.."  backend "..st.backend.."  resolve#"..tostring(st.gen).." ("..tostring(st.resolveReason)..")")
+        table.insert(lines,string.format("api  CAS=%s getconnections=%s firesignal=%s getrenv=%s",tostring(st.api and st.api.cas),tostring(st.api and st.api.getconnections),tostring(st.api and st.api.firesignal),tostring(st.api and st.api.getrenv)))
+        for _,c in ipairs({"ATTACK","HEAVY","GUARD","DASH","PARRY"}) do
+            local x=SA.caps[c]
+            if x then
+                table.insert(lines,string.format("%-7s %-15s %s",c,x.status,tostring(x.reason)))
+                for i,b in ipairs(x.candidates) do if i>3 then break end; table.insert(lines,"        "..(b==x.binding and "▸ " or "  ")..b.label..(b.lastError and ("  ["..b.lastError.."]") or "")) end
+            end
+        end
+        local keys={}; for key,x in pairs(SA.skills) do table.insert(keys,{key=key,x=x}) end
+        table.sort(keys,function(a,b) return (a.x.index or 99)<(b.x.index or 99) end)
+        for _,e in ipairs(keys) do
+            local x=e.x
+            table.insert(lines,string.format("SKILL %-2s %-15s %s",e.key,x.status,tostring(x.reason)))
+            for i,b in ipairs(x.candidates) do if i>2 then break end; table.insert(lines,"        "..(b==x.binding and "▸ " or "  ")..b.label..(b.lastError and ("  ["..b.lastError.."]") or "")) end
+        end
+        if #SA.listed.cas>0 then table.insert(lines,"CAS actions: "..table.concat(SA.listed.cas,"  ",1,math.min(#SA.listed.cas,10))) end
+        if #SA.listed.bindables>0 then table.insert(lines,"bindables (listed, not invoked): "..table.concat(SA.listed.bindables,"  ")) end
+        if #SA.listed.controllers>0 then table.insert(lines,"controllers (listed, not invoked): "..table.concat(SA.listed.controllers,"  ")) end
+        local t=st.testing and st.test or st.lastTest
+        if t then
+            table.insert(lines,"silent test · "..tostring(t.step))
+            for _,x in ipairs(t.results or {}) do table.insert(lines,string.format("  %-9s %s  %s  %s",x.cap,x.pass and "PASS" or "no  ",tostring(x.label),tostring(x.evidence or x.error or ""))) end
+        end
+        table.insert(lines,string.format("fight  physical combat %d · menu/loot %d · blocked %d · executed %d (silent %d, legacy %d)",st.physicalCombat,st.physicalOther,st.blocked,
+            st.fight and st.fight.executed or 0,st.fight and st.fight.silent or 0,st.fight and st.fight.legacy or 0))
+        table.insert(lines,string.format("audit  total %d · non-combat %d · blocked %d · legacy adapter %d (+%d releases)",A.total,A.nonBus,A.blocked,st.legacy.count,st.legacy.releases))
+        for i=#A.events,math.max(1,#A.events-7),-1 do local e=A.events[i]; table.insert(lines,string.format("  %-6s %-14s %-15s %s",e.kind,e.detail,e.scope,e.allowed and "sent" or ("BLOCKED "..tostring(e.why)))) end
+        U.setText(sbox,table.concat(lines,"\n"))
+    end)
+    local IK=RAVYN.InstaKillAdapter; if not IK then return end
+    local _,d=U.card(page,"Threshold Finisher · 99%","InstaKillAdapter + CreditProbe. Each finisher test lists everything needed to judge it.",{order=5})
+    local box=U.label(d,"",11,C.sub,U.F.mono,{AutomaticSize=Enum.AutomaticSize.Y,Size=UDim2.new(1,0,0,0),TextYAlignment=Enum.TextYAlignment.Top})
+    U.addRefresh(function()
+        if U.activePage~="Diagnostics" then return end
+        local s=IK.GetStatus()
+        local lines={
+            "mode         "..s.mode.."  active "..s.activeClass.."  threshold "..string.format("%.0f%%",s.threshold*100).."  (stays 1%)",
+            "true_one_hit "..s.trueOneHitStatus.."  (trueOneHit=false)",
+            "verification "..s.statusText.."  tests "..s.testsRun.."  lethal "..s.lethalSuccesses.."  credit "..s.creditSuccesses.."  misses "..s.misses.."  invalid "..s.invalidVerifications.."  kill-only "..s.killOnly,
+            "matrix       normal "..s.normalMobPassed.."/"..s.required.normal.."  bosses "..s.bossDistinct.."/"..s.required.bosses.." different  high-HP "..s.highHpBossPassed.."/"..s.required.highHp.."  streak "..s.consecutivePassed.."/"..s.testsRequired,
+            "finisher     "..tostring(s.finisherLabel).."  backend "..tostring(s.finisherBackend).."  phase "..s.phase..(s.blockReason and ("  blocked "..s.blockReason) or ""),
+            "not tests    died before finisher "..s.diedBeforeFinisher.."  window skipped "..s.windowSkips.."  not lethal after settle "..s.notLethal,
+            s.verificationStatus=="VERIFIED" and ("verified     "..tostring(s.verifiedMatrix)) or ("needed       "..table.concat(s.missing,", ")),
+            "",
+        }
+        local tests=IK.V.tests
+        for i=#tests,math.max(1,#tests-7),-1 do local r=tests[i]; table.insert(lines,(r.text or IK.describe(r))..string.format("  · phys %s · blocked %s",tostring(r.physicalDuringVerify),tostring(r.blockedDuringVerify))) end
+        if #tests==0 then table.insert(lines,"no finisher tests yet · set Insta Kill to Threshold 99% · test to run the matrix") end
+        table.insert(lines,"")
+        for i=#IK.records,math.max(1,#IK.records-5),-1 do local r=IK.records[i]; if not r.finisher then table.insert(lines,r.text or IK.describe(r)) end end
+        U.setText(box,table.concat(lines,"\n"))
+    end)
+end
+
+-- ================= VISUALS =================
+function U.buildVisuals(page)
+    local V=RAVYN.Visuals
+    local vv=function() return cfg().Visuals end
+    local sv=function(k) return function(v) return RAVYN:SetVisual(k,v) end end
+    local _,e=U.card(page,"ESP","Pooled labels · no per-frame rebuild · other players are not tracked.",{order=1})
+    U.toggle(e,{label="Mobs",get=function() return vv().Mobs end,set=sv("Mobs")})
+    U.toggle(e,{label="Bosses",desc="Label + highlight",get=function() return vv().Bosses end,set=sv("Bosses")})
+    U.toggle(e,{label="Quest target",desc="The current objective target",get=function() return vv().QuestTarget end,set=sv("QuestTarget")})
+    U.toggle(e,{label="Chests",desc="Nearby chest prompts (bounded scan)",get=function() return vv().Chests end,set=sv("Chests")})
+    U.toggle(e,{label="Drops",desc="Nearby drop / soul prompts (bounded scan)",get=function() return vv().Drops end,set=sv("Drops")})
+    local _,o=U.card(page,"Labels","",{order=2})
+    U.toggle(o,{label="Name",get=function() return vv().ShowName end,set=sv("ShowName")})
+    U.toggle(o,{label="Distance",get=function() return vv().ShowDistance end,set=sv("ShowDistance")})
+    U.toggle(o,{label="Health",get=function() return vv().ShowHealth end,set=sv("ShowHealth")})
+    U.label(o,"Range",12,C.sub,U.F.semi)
+    U.segment(o,{{"250",250},{"500",500},{"1000",1000},{"1500",1500}},function() return vv().MaxDistance end,setc("Visuals.MaxDistance"))
+    stateRow(o,"Status",function() return (V and V.state) or "OFF",(V and V.count and V.count>0) and (V.count.." tracked") or "" end)
+end
+return true]==========]); if not ok then return end end
 do local ok=runChunk("UI384_Mount.lua",[==========[local G=(getgenv and getgenv()) or _G
 local CTX=G.__RAVYN_CTX
 local RAVYN=CTX["RAVYN"]
 local U=CTX["UI384"]
 local C=U.C
 local UIS=game:GetService("UserInputService")
+-- v3.9 simple sidebar; developer pages (dev=true) only appear in Developer Mode
 local PAGES={
-    {"Home","◆",{"home","dashboard","status"},"buildHome"},
-    {"Auto Play","◎",{"auto","play","master","mode","boss rotation","scheduler"},"buildAutoPlay"},
-    {"Quests","◇",{"quest","crow","muzan","level","turn"},"buildQuests"},
-    {"Farm","◉",{"farm","mob","target","npc","aura","radius"},"buildFarm"},
-    {"Combat","✦",{"combat","m1","skill","combo","ragdoll","stun","knockback","mitigation"},"buildCombat"},
+    {"Home","◆",{"home","start","go","status"},"buildHome"},
+    {"Auto","◎",{"auto","play","mode","boss rotation"},"buildAutoPlay"},
+    {"Combat","✦",{"combat","skill","speed","m1","ragdoll","stun","knockback"},"buildCombat"},
+    {"Boss","◉",{"boss","farm","mob","target","npc","aura","rotation"},"buildBoss"},
+    {"Quests","◇",{"quest","crow","muzan"},"buildQuests"},
     {"Loot","◈",{"loot","chest","drop"},"buildLoot"},
-    {"Travel","➤",{"travel","hover","noclip","teleport","tween","place","height"},"buildTravel"},
-    {"Intelligence","✧",{"face","dodge","guard","threat","learn","loadout","skills"},"buildIntelligence"},
-    {"Research","⌬",{"research","probe","learn","evidence","crow","muzan","training","knowledge","progress"},"buildResearch"},
-    {"Dungeon","▣",{"dungeon","ouwigahara","card"},"buildDungeon"},
-    {"Diagnostics","⌘",{"diag","log","feed","boss","debug","error"},"buildDiagnostics"},
-    {"Settings","⚙",{"settings","esp","afk","speed","save","motion"},"buildSettings"},
+    {"Travel","➤",{"travel","hover","noclip","teleport","place","height"},"buildTravel"},
+    {"Training","☯",{"training","breathing","trainer","station","mastery"},"buildTraining"},
+    {"Dungeon","▣",{"dungeon","ouwigahara","card","floor"},"buildDungeon"},
+    {"Visuals","◐",{"visuals","esp","highlight","chest","drop"},"buildVisuals"},
+    {"Intelligence","✧",{"face","dodge","guard","threat","learn","loadout"},"buildIntelligence",true},
+    {"Research","⌬",{"research","probe","learn","evidence","knowledge"},"buildResearch",true},
+    {"Diagnostics","⌘",{"diag","log","feed","debug","error"},"buildDiagnostics",true},
+    {"Settings","⚙",{"settings","esp","afk","save","motion","developer","advanced"},"buildSettings"},
 }
 local BADGES={
     Quests=function(S) local e=U.explain(S.quest.fail); if S.questEnabled and not S.autoplay then return C.orange end; return (e and e.color~=C.gold and e.color~=C.cyan) and e.color or nil end,
-    Combat=function(S) if not RAVYN.Config.Combat.AutoAbilities then return nil end; local e=U.explain(S.skillFail); return (e and (e.color==C.red or e.color==C.orange)) and e.color or nil end,
+    Combat=function(S)
+        local bs=U.busStatus and U.busStatus()
+        if bs and bs.mode=="SILENT" and bs.physicalCombat>0 then return C.red end
+        if bs and bs.mode=="SILENT" and bs.caps.ATTACK.status~="VERIFIED_SILENT" then return C.orange end
+        if not RAVYN.Config.Combat.AutoAbilities then return nil end; local e=U.explain(S.skillFail); return (e and (e.color==C.red or e.color==C.orange)) and e.color or nil end,
     Loot=function(S) return S.loot.fail and C.orange or nil end,
     Diagnostics=function(S) return S.errorRecent and C.red or nil end,
 }
@@ -9182,12 +15034,12 @@ local function mount()
     local gui=U.n("ScreenGui",pg,{Name="RAVYN_V384",ResetOnSpawn=false,ZIndexBehavior=Enum.ZIndexBehavior.Sibling,IgnoreGuiInset=true,DisplayOrder=50})
     RAVYN._gui=gui; U.gui=gui
     local cam=workspace.CurrentCamera
-    local function sizeFor() local v=(cam and cam.ViewportSize) or Vector2.new(1600,900); return math.floor(math.clamp(v.X*.62,760,1120)),math.floor(math.clamp(v.Y*.78,500,720)) end
+    local function sizeFor() local v=(cam and cam.ViewportSize) or Vector2.new(1600,900); return math.floor(math.clamp(v.X*.68,860,1240)),math.floor(math.clamp(v.Y*.82,560,780)) end
     local W,H=sizeFor()
-    local shadow=U.n("Frame",gui,{Size=UDim2.fromOffset(W+24,H+24),Position=UDim2.new(.5,-(W+24)/2,.5,-(H+24)/2+4),BackgroundColor3=Color3.new(0,0,0),BackgroundTransparency=.72,BorderSizePixel=0}); U.round(shadow,28)
+    local shadow=U.n("Frame",gui,{Name="Shadow",Size=UDim2.fromOffset(W+24,H+24),Position=UDim2.new(.5,-(W+24)/2,.5,-(H+24)/2+4),BackgroundColor3=Color3.new(0,0,0),BackgroundTransparency=.72,BorderSizePixel=0}); U.round(shadow,28)
     -- v3.8.4.3: plain Frame. A window-sized CanvasGroup re-renders its whole texture on every descendant change,
     -- which flickered under combat telemetry. Open/hide animate UIScale only.
-    local win=U.n("Frame",gui,{Size=UDim2.fromOffset(W,H),Position=UDim2.new(.5,-W/2,.5,-H/2),BackgroundColor3=C.bg,BorderSizePixel=0,Active=true,ClipsDescendants=true})
+    local win=U.n("Frame",gui,{Name="Window",Size=UDim2.fromOffset(W,H),Position=UDim2.new(.5,-W/2,.5,-H/2),BackgroundColor3=C.bg,BorderSizePixel=0,Active=true,ClipsDescendants=true})
     U.round(win,20); U.stroke(win,C.line,1,.15)
     U.n("UISizeConstraint",win,{MinSize=Vector2.new(720,480)})
     local scale=U.n("UIScale",win,{Scale=.96})
@@ -9197,21 +15049,31 @@ local function mount()
     U.n("Frame",top,{Size=UDim2.new(1,0,0,1),Position=UDim2.new(0,0,1,-1),BackgroundColor3=C.line,BorderSizePixel=0})
     U.label(top,"RAVYN",20,C.text,U.F.bold,{Size=UDim2.fromOffset(90,60),Position=UDim2.fromOffset(20,0),TextWrapped=false})
     local gchip=U.n("Frame",top,{Size=UDim2.fromOffset(260,28),Position=UDim2.fromOffset(112,16),BackgroundColor3=C.raised,BorderSizePixel=0}); U.round(gchip,14)
+    local halo=U.n("Frame",gchip,{Size=UDim2.fromOffset(8,8),Position=UDim2.new(0,16,.5,0),AnchorPoint=Vector2.new(.5,.5),BackgroundTransparency=1,BorderSizePixel=0}); U.round(halo,20)
+    local haloStroke=U.stroke(halo,C.gray,1,.15)
     local gdot=U.n("Frame",gchip,{Size=UDim2.fromOffset(8,8),Position=UDim2.new(0,12,.5,-4),BackgroundColor3=C.gray,BorderSizePixel=0}); U.round(gdot,4)
     local gtext=U.label(gchip,"READY",11,C.text,U.F.bold,{Size=UDim2.new(1,-30,1,0),Position=UDim2.fromOffset(26,0),TextWrapped=false,TextTruncate=Enum.TextTruncate.AtEnd})
     local ver=U.label(top,"",11,C.faint,U.F.body,{Size=UDim2.fromOffset(200,60),Position=UDim2.new(1,-300,0,0),TextXAlignment=Enum.TextXAlignment.Right,TextWrapped=false})
     local function topBtn(txt,x) local b=U.n("TextButton",top,{Size=UDim2.fromOffset(34,34),Position=UDim2.new(1,x,.5,-17),BackgroundColor3=C.card,Text=txt,TextColor3=C.text,TextSize=16,Font=U.F.bold,AutoButtonColor=false,BorderSizePixel=0}); U.round(b,10)
         table.insert(RAVYN._connections,b.MouseEnter:Connect(function() U.anim(b,.12,{BackgroundColor3=C.raised}) end)); table.insert(RAVYN._connections,b.MouseLeave:Connect(function() U.anim(b,.14,{BackgroundColor3=C.card}) end)); return b end
     local hideB=topBtn("—",-84); local closeB=topBtn("×",-44)
-    U.addRefresh(function(S) U.setText(gtext,S.global); U.setColor(gtext,"TextColor3",S.globalColor); U.setColor(gdot,"BackgroundColor3",S.globalColor); U.setColor(gchip,"BackgroundColor3",U.dimOf(S.globalColor)); U.setText(ver,"v"..S.version) end)
+    local lastGlobal=nil
+    U.addRefresh(function(S)
+        U.setText(gtext,S.global); U.setColor(gtext,"TextColor3",S.globalColor); U.setColor(gdot,"BackgroundColor3",S.globalColor); U.setColor(gchip,"BackgroundColor3",U.dimOf(S.globalColor)); U.setText(ver,"v"..S.version)
+        if lastGlobal~=S.global then
+            lastGlobal=S.global; halo.Size=UDim2.fromOffset(8,8); haloStroke.Transparency=.1; haloStroke.Color=S.globalColor
+            U.anim(halo,.48,{Size=UDim2.fromOffset(26,26)},Enum.EasingStyle.Quint,Enum.EasingDirection.Out)
+            U.anim(haloStroke,.5,{Transparency=1},Enum.EasingStyle.Quint,Enum.EasingDirection.Out)
+        end
+    end)
     -- sidebar
-    local side=U.n("Frame",win,{Size=UDim2.new(0,184,1,-60),Position=UDim2.fromOffset(0,60),BackgroundColor3=C.panel,BorderSizePixel=0})
-    local search=U.n("TextBox",side,{Size=UDim2.new(1,-24,0,34),Position=UDim2.fromOffset(12,12),BackgroundColor3=C.card,Text="",PlaceholderText="Search or command…",PlaceholderColor3=C.faint,TextColor3=C.text,TextSize=12,Font=U.F.body,ClearTextOnFocus=false,BorderSizePixel=0,TextXAlignment=Enum.TextXAlignment.Left}); U.round(search,9); U.pad(search,10,10,0,0)
-    local nav=U.n("ScrollingFrame",side,{Size=UDim2.new(1,-16,1,-60),Position=UDim2.fromOffset(8,56),BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=0,AutomaticCanvasSize=Enum.AutomaticSize.Y,CanvasSize=UDim2.new()}); U.list(nav,3)
+    local side=U.n("Frame",win,{Size=UDim2.new(0,220,1,-60),Position=UDim2.fromOffset(0,60),BackgroundColor3=C.panel,BorderSizePixel=0})
+    local search=U.n("TextBox",side,{Size=UDim2.new(1,-24,0,40),Position=UDim2.fromOffset(12,12),BackgroundColor3=C.card,Text="",PlaceholderText="Filter pages… (Ctrl+K)",PlaceholderColor3=C.faint,TextColor3=C.text,TextSize=12,Font=U.F.body,ClearTextOnFocus=false,BorderSizePixel=0,TextXAlignment=Enum.TextXAlignment.Left}); U.round(search,9); U.pad(search,10,10,0,0); U.stroke(search,C.line,1,.4)
+    local nav=U.n("ScrollingFrame",side,{Size=UDim2.new(1,-16,1,-68),Position=UDim2.fromOffset(8,64),BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=0,AutomaticCanvasSize=Enum.AutomaticSize.Y,CanvasSize=UDim2.new()}); U.list(nav,3)
     local marker=U.n("Frame",side,{Size=UDim2.fromOffset(3,22),Position=UDim2.fromOffset(8,70),BackgroundColor3=C.gold,BorderSizePixel=0,ZIndex=3}); U.round(marker,2)
     -- content
-    local content=U.n("Frame",win,{Size=UDim2.new(1,-184,1,-60),Position=UDim2.fromOffset(184,60),BackgroundTransparency=1})
-    local heading=U.label(content,"Home",20,C.text,U.F.bold,{Size=UDim2.new(1,-48,0,28),Position=UDim2.fromOffset(24,16),TextWrapped=false})
+    local content=U.n("Frame",win,{Size=UDim2.new(1,-220,1,-60),Position=UDim2.fromOffset(220,60),BackgroundTransparency=1})
+    local heading=U.label(content,"Home",24,C.text,U.F.bold,{Size=UDim2.new(1,-48,0,32),Position=UDim2.fromOffset(24,14),TextWrapped=false})
     local host=U.n("Frame",content,{Size=UDim2.new(1,-40,1,-62),Position=UDim2.fromOffset(20,54),BackgroundTransparency=1,ClipsDescendants=true})
     -- toasts + tooltip
     U.toastHost=U.n("Frame",content,{Size=UDim2.fromOffset(320,0),AutomaticSize=Enum.AutomaticSize.Y,Position=UDim2.new(1,-340,1,-20),AnchorPoint=Vector2.new(0,1),BackgroundTransparency=1,ZIndex=30})
@@ -9224,23 +15086,32 @@ local function mount()
     local function show(name)
         if not groups[name] or (U.activePage==name and groups[name].Visible) then return end
         local prev=groups[U.activePage]; U.activePage=name; U.setText(heading,name)
-        if prev and prev~=groups[name] then prev.Visible=false end
-        local g=groups[name]; g.Visible=true; g.Position=UDim2.fromOffset(8,0)
-        U.anim(g,.2,{Position=UDim2.fromOffset(0,0)})
+        if prev and prev~=groups[name] then
+            U.anim(prev,.13,{Position=UDim2.fromOffset(-12,0)},Enum.EasingStyle.Quint,Enum.EasingDirection.Out)
+            local old=prev; task.delay(.14,function() if U.activePage~=old.Name and old.Parent then old.Visible=false end end)
+        end
+        local g=groups[name]; g.Visible=true; U.reveal(g,18)
         U.runPage(name) -- bring the newly shown page up to date once
         for n2,b in pairs(U.navButtons) do U.setColor(b,"TextColor3",n2==name and C.text or C.sub,.14); U.setColor(b,"BackgroundTransparency",n2==name and 0 or 1,.14) end
         task.defer(function() local b=U.navButtons[name]; if b then U.anim(marker,.24,{Position=UDim2.fromOffset(8,b.AbsolutePosition.Y-side.AbsolutePosition.Y+7)}) end end)
     end
     U.show=show
+    U.onDevModeChanged=function(on)
+        for n2 in pairs(U.devNav or {}) do local b=U.navButtons[n2]; if b then b.Visible=on end end
+        if not on and U.devNav and U.devNav[U.activePage] then show("Home") end
+    end
     for i,def in ipairs(PAGES) do
         local name=def[1]
         local g=U.n("Frame",host,{Name=name,Size=UDim2.fromScale(1,1),BackgroundTransparency=1,Visible=false})
+        U.n("UIScale",g,{Name="RAVYN_PageScale",Scale=1})
         local sc=U.n("ScrollingFrame",g,{Size=UDim2.fromScale(1,1),BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=3,ScrollBarImageColor3=C.faint,AutomaticCanvasSize=Enum.AutomaticSize.Y,CanvasSize=UDim2.new(),ScrollingDirection=Enum.ScrollingDirection.Y})
         U.list(sc,12); U.pad(sc,2,8,2,24)
         groups[name]=g; U.pages[name]=sc
-        local b=U.n("TextButton",nav,{Size=UDim2.new(1,0,0,36),BackgroundColor3=C.raised,BackgroundTransparency=1,Text="   "..def[2].."   "..name,TextColor3=C.sub,TextSize=13,Font=U.F.semi,TextXAlignment=Enum.TextXAlignment.Left,AutoButtonColor=false,BorderSizePixel=0,LayoutOrder=i}); U.round(b,9)
+        local b=U.n("TextButton",nav,{Size=UDim2.new(1,0,0,46),BackgroundColor3=C.raised,BackgroundTransparency=1,Text="  "..def[2].."  "..name,TextColor3=C.sub,TextSize=14,Font=U.F.semi,TextXAlignment=Enum.TextXAlignment.Left,AutoButtonColor=false,BorderSizePixel=0,LayoutOrder=i}); U.round(b,11)
+        U.pressable(b,{hoverScale=1.01,pressScale=.975})
         local badge=U.n("Frame",b,{Size=UDim2.fromOffset(8,8),Position=UDim2.new(1,-18,.5,-4),BackgroundColor3=C.orange,BorderSizePixel=0,Visible=false}); U.round(badge,4)
         U.navButtons[name]=b; U.badges[name]=badge
+        if def[5] then b.Visible=RAVYN.Config.UI.DeveloperMode==true; U.devNav=U.devNav or {}; U.devNav[name]=true end
         table.insert(RAVYN._connections,b.Activated:Connect(function() show(name) end))
         U.buildingPage=name
         local ok,err=pcall(U[def[4]],sc)
@@ -9253,42 +15124,177 @@ local function mount()
     -- search / command palette
     local function matches(q)
         local out={}
-        for _,def in ipairs(PAGES) do
+        local dev=RAVYN.Config.UI.DeveloperMode==true
+        for _,def in ipairs(PAGES) do if dev or not def[5] then
             local hit=string.find(string.lower(def[1]),q,1,true)~=nil
             if not hit then for _,k in ipairs(def[3]) do if string.find(k,q,1,true) then hit=true; break end end end
             if hit then table.insert(out,def[1]) end
-        end
+        end end
         return out
     end
     table.insert(RAVYN._connections,search:GetPropertyChangedSignal("Text"):Connect(function()
         local q=string.lower(search.Text or ""); local set={}
         if q~="" then for _,n2 in ipairs(matches(q)) do set[n2]=true end end
-        for n2,b in pairs(U.navButtons) do b.Visible=(q=="") or set[n2]==true end
+        local dev=RAVYN.Config.UI.DeveloperMode==true
+        for n2,b in pairs(U.navButtons) do b.Visible=((q=="") or set[n2]==true) and (dev or not (U.devNav and U.devNav[n2])) end
     end))
     table.insert(RAVYN._connections,search.FocusLost:Connect(function(enter)
         if not enter then return end
         local q=string.lower(search.Text or "")
         if q=="stop" or q=="stop everything" then pcall(function() RAVYN:SetAutoPlay(false); RAVYN:Stop() end); U.toast("Stopped","success")
+        elseif q=="start" or q=="go" then local r=RAVYN:Go(RAVYN.Config.Go.Goal); U.report(r,"RAVYN started")
+        elseif q=="pause" then local r=RAVYN:GoPause(); U.report(r,"Paused")
+        elseif q=="home" then show("Home")
         else local m=matches(q); if m[1] then show(m[1]) end end
         search.Text=""
     end))
+    -- ── PREMIUM COMMAND PALETTE (Ctrl+K / /) ─────────────────────────────────
+    local PALETTE_CMDS={
+        {label="Start RAVYN",        sub="Begin auto play",          fn=function() local r=RAVYN:Go(RAVYN.Config.Go.Goal); U.report(r,"RAVYN started") end},
+        {label="Pause RAVYN",        sub="Pause current session",    fn=function() local r=RAVYN:GoPause(); U.report(r,"Paused") end},
+        {label="Stop RAVYN",         sub="Stop everything",          fn=function() pcall(function() RAVYN:SetAutoPlay(false); RAVYN:Stop() end); U.toast("Stopped","success") end},
+    }
+    for _,def2 in ipairs(PAGES) do
+        if not def2[5] then table.insert(PALETTE_CMDS,{label="Go to "..def2[1], sub="Navigate · "..table.concat(def2[3],", "), fn=function() show(def2[1]) end}) end
+    end
+    -- v1.0.1: generation counter lives beside pal/palOpen so both closePalette and openCommandPalette share it
+    local pal=nil; local palOpen=false; local palGen=0
+    -- v1.0.1: row-level connections stored separately so renderList can disconnect them without polluting RAVYN._connections
+    local paletteRowConns={}
+    local function clearPaletteRowConns()
+        for _,c in ipairs(paletteRowConns) do pcall(function() c:Disconnect() end) end
+        paletteRowConns={}
+    end
+    local function buildCommandPalette()
+        if pal then return end
+        local ov=U.n("Frame",gui,{Size=UDim2.fromScale(1,1),BackgroundColor3=Color3.new(0,0,0),BackgroundTransparency=.52,ZIndex=200,Visible=false,Active=true})
+        local card=U.n("Frame",ov,{Size=UDim2.fromOffset(500,0),AutomaticSize=Enum.AutomaticSize.Y,Position=UDim2.new(.5,-250,.22,0),BackgroundColor3=C.panel,BorderSizePixel=0,ZIndex=201}); U.round(card,16); U.stroke(card,C.line,1,.08)
+        local csc=U.n("UIScale",card,{Scale=.94})
+        local inp=U.n("TextBox",card,{Size=UDim2.new(1,-32,0,56),Position=UDim2.fromOffset(16,0),BackgroundTransparency=1,Text="",PlaceholderText="Search commands or pages…",PlaceholderColor3=C.faint,TextColor3=C.text,TextSize=17,Font=U.F.semi,ClearTextOnFocus=false,BorderSizePixel=0,TextXAlignment=Enum.TextXAlignment.Left,ZIndex=202})
+        -- v1.0.1: Ctrl+K badge (widened from 36 to 52 px to fit the label)
+        local kbd=U.label(card,"Ctrl+K",11,C.faint,U.F.mono,{Size=UDim2.fromOffset(52,20),Position=UDim2.new(1,-68,0,18),ZIndex=202,TextXAlignment=Enum.TextXAlignment.Center})
+        U.round(U.n("Frame",card,{Size=UDim2.fromOffset(52,20),Position=UDim2.new(1,-68,0,18),BackgroundColor3=C.card,BorderSizePixel=0,ZIndex=201}),6)
+        U.n("Frame",card,{Size=UDim2.new(1,-32,0,1),Position=UDim2.fromOffset(16,58),BackgroundColor3=C.line,ZIndex=202})
+        -- v1.0.1: list is fixed-height so the palette never overflows the viewport; UISizeConstraint caps at 356 px
+        -- AutomaticCanvasSize keeps internal scrolling working for long result sets
+        local list=U.n("ScrollingFrame",card,{Size=UDim2.new(1,0,0,0),AutomaticSize=Enum.AutomaticSize.Y,Position=UDim2.fromOffset(0,62),BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=3,ScrollBarImageColor3=C.faint,AutomaticCanvasSize=Enum.AutomaticSize.Y,CanvasSize=UDim2.new(),ZIndex=202}); U.list(list,2); U.pad(list,4,4,4,8)
+        U.n("UISizeConstraint",list,{MaxSize=Vector2.new(math.huge,356)})
+        local rowFns={}
+        local selI=1
+        local function closePalette()
+            -- v1.0.1: capture generation before the delay; only hide if palette has not been reopened since
+            palOpen=false; inp.Text=""; clearPaletteRowConns()
+            local gen=palGen
+            U.anim(csc,.12,{Scale=.94}); U.anim(ov,.13,{BackgroundTransparency=1})
+            task.delay(.14,function() if not palOpen and palGen==gen and ov.Parent then ov.Visible=false end end)
+        end
+        local function runSel()
+            local fn=rowFns[selI]; if not fn then return end
+            closePalette(); task.defer(fn)
+        end
+        local function setSelRow(idx,rows)
+            selI=math.clamp(idx,1,#rows)
+            for ri,r in ipairs(rows) do
+                local active=(ri==selI)
+                U.anim(r,.08,{BackgroundTransparency=active and 0 or 1,BackgroundColor3=active and C.raised or C.card})
+            end
+        end
+        local function renderList(q)
+            -- v1.0.1: disconnect previous row connections before destroying their owners
+            clearPaletteRowConns()
+            for _,c in ipairs(list:GetChildren()) do if c:IsA("TextButton") then c:Destroy() end end
+            rowFns={}; local rows={}; selI=1
+            local lq=string.lower(q or "")
+            for _,cmd in ipairs(PALETTE_CMDS) do
+                local hit=(lq=="" or string.find(string.lower(cmd.label),lq,1,true) or (cmd.sub and string.find(string.lower(cmd.sub),lq,1,true)))
+                if hit then
+                    local ri=#rowFns+1; table.insert(rowFns,cmd.fn)
+                    local row=U.n("TextButton",list,{Size=UDim2.new(1,-8,0,46),BackgroundColor3=C.raised,BackgroundTransparency=1,Text="",AutoButtonColor=false,BorderSizePixel=0,ZIndex=203,LayoutOrder=ri}); U.round(row,10)
+                    table.insert(rows,row)
+                    U.label(row,cmd.label,14,C.text,U.F.semi,{Size=UDim2.new(1,-20,0,24),Position=UDim2.fromOffset(14,4),TextWrapped=false,ZIndex=204})
+                    U.label(row,cmd.sub or "",11,C.sub,U.F.body,{Size=UDim2.new(1,-20,0,17),Position=UDim2.fromOffset(14,26),TextWrapped=false,ZIndex=204,TextTruncate=Enum.TextTruncate.AtEnd})
+                    local ci=ri
+                    -- v1.0.1: row connections go into paletteRowConns, not RAVYN._connections
+                    table.insert(paletteRowConns,row.MouseEnter:Connect(function() setSelRow(ci,rows) end))
+                    table.insert(paletteRowConns,row.Activated:Connect(function() selI=ci; runSel() end))
+                end
+            end
+            if #rows>0 then setSelRow(1,rows) end
+        end
+        -- Permanent palette connections stay in RAVYN._connections (cleaned up on Destroy)
+        table.insert(RAVYN._connections,inp:GetPropertyChangedSignal("Text"):Connect(function() renderList(inp.Text) end))
+        table.insert(RAVYN._connections,UIS.InputBegan:Connect(function(i,gp)
+            if not palOpen then return end
+            if i.KeyCode==Enum.KeyCode.Escape then closePalette()
+            elseif i.KeyCode==Enum.KeyCode.Return or i.KeyCode==Enum.KeyCode.KeypadEnter then runSel()
+            elseif i.KeyCode==Enum.KeyCode.Up then
+                local rows2={}; for _,c in ipairs(list:GetChildren()) do if c:IsA("TextButton") then table.insert(rows2,c) end end
+                setSelRow(selI-1,rows2)
+            elseif i.KeyCode==Enum.KeyCode.Down then
+                local rows2={}; for _,c in ipairs(list:GetChildren()) do if c:IsA("TextButton") then table.insert(rows2,c) end end
+                setSelRow(selI+1,rows2)
+            end
+        end))
+        table.insert(RAVYN._connections,ov.InputBegan:Connect(function(i)
+            if i.UserInputType==Enum.UserInputType.MouseButton1 then
+                local mx,my=i.Position.X,i.Position.Y; local cp=card.AbsolutePosition; local cs=card.AbsoluteSize
+                if mx<cp.X or mx>cp.X+cs.X or my<cp.Y or my>cp.Y+cs.Y then closePalette() end
+            end
+        end))
+        pal={ov=ov,inp=inp,csc=csc,renderList=renderList,closePalette=closePalette}
+    end
+    local function openCommandPalette()
+        buildCommandPalette()
+        if palOpen then pal.closePalette(); return end
+        -- v1.0.1: increment generation so any in-flight delayed close from the previous session is invalidated
+        palGen=palGen+1
+        palOpen=true; pal.ov.BackgroundTransparency=1; pal.ov.Visible=true; pal.csc.Scale=.94
+        pal.renderList("")
+        U.anim(pal.ov,.18,{BackgroundTransparency=.52})
+        U.anim(pal.csc,.24,{Scale=1},Enum.EasingStyle.Back,Enum.EasingDirection.Out)
+        task.defer(function() if pal.inp and pal.inp.Parent then pal.inp:CaptureFocus() end end)
+    end
+    table.insert(RAVYN._connections,UIS.InputBegan:Connect(function(i,gp)
+        if gp then return end
+        local ctrl=UIS:IsKeyDown(Enum.KeyCode.LeftControl) or UIS:IsKeyDown(Enum.KeyCode.RightControl)
+        if ctrl and i.KeyCode==Enum.KeyCode.K then openCommandPalette()
+        elseif i.KeyCode==Enum.KeyCode.Slash and not ctrl then
+            local focused=UIS:GetFocusedTextBox()
+            if not focused then openCommandPalette() end
+        end
+    end))
     -- hide / restore / close / drag
-    local pill=U.n("TextButton",gui,{Size=UDim2.fromOffset(132,40),Position=UDim2.new(0,20,.5,-20),BackgroundColor3=C.panel,Text="",AutoButtonColor=false,Visible=false,BorderSizePixel=0}); U.round(pill,20); U.stroke(pill,C.line,1,.2)
-    local pdot=U.n("Frame",pill,{Size=UDim2.fromOffset(8,8),Position=UDim2.new(0,16,.5,-4),BackgroundColor3=C.gray,BorderSizePixel=0}); U.round(pdot,4)
-    U.label(pill,"RAVYN",13,C.gold,U.F.bold,{Size=UDim2.new(1,-40,1,0),Position=UDim2.fromOffset(32,0),TextWrapped=false})
+    -- ── PREMIUM MINI HUD ────────────────────────────────────────────────────
+    local pill=U.n("Frame",gui,{Size=UDim2.fromOffset(192,62),Position=UDim2.new(0,20,.5,-31),BackgroundColor3=C.panel,Visible=false,BorderSizePixel=0,Active=true}); U.round(pill,18); U.stroke(pill,C.line,1,.15)
+    local pillScale=U.n("UIScale",pill,{Scale=.92})
+    local pdot=U.n("Frame",pill,{Size=UDim2.fromOffset(9,9),Position=UDim2.new(0,16,.5,-18),BackgroundColor3=C.gray,BorderSizePixel=0}); U.round(pdot,5)
+    local ptopL=U.label(pill,"RAVYN",13,C.gold,U.F.bold,{Size=UDim2.new(1,-36,0,20),Position=UDim2.fromOffset(32,10),TextWrapped=false,TextXAlignment=Enum.TextXAlignment.Left})
+    local pstatL=U.label(pill,"IDLE",11,C.gray,U.F.semi,{Size=UDim2.new(1,-68,0,16),Position=UDim2.fromOffset(32,28),TextWrapped=false,TextXAlignment=Enum.TextXAlignment.Left})
+    local pactL=U.label(pill,"—",10,C.sub,U.F.body,{Size=UDim2.new(1,-32,0,14),Position=UDim2.fromOffset(16,44),TextWrapped=false,TextXAlignment=Enum.TextXAlignment.Left,TextTruncate=Enum.TextTruncate.AtEnd})
+    local prestore=U.n("TextButton",pill,{Size=UDim2.fromOffset(22,22),Position=UDim2.new(1,-30,.5,-11),BackgroundColor3=C.card,Text="↗",TextColor3=C.sub,TextSize=11,Font=U.F.bold,AutoButtonColor=false,BorderSizePixel=0}); U.round(prestore,7); U.stroke(prestore,C.line,1,.3)
+    U.pressable(prestore,{hoverScale=1.04,pressScale=.94})
+    -- pill drag
+    local pdrag,pdStart,ppStart=false,nil,nil
+    table.insert(RAVYN._connections,pill.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then pdrag=true; pdStart=i.Position; ppStart=pill.Position end end))
+    table.insert(RAVYN._connections,UIS.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then pdrag=false end end))
+    table.insert(RAVYN._connections,UIS.InputChanged:Connect(function(i)
+        if pdrag and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then
+            local d=i.Position-pdStart; pill.Position=UDim2.new(ppStart.X.Scale,ppStart.X.Offset+d.X,ppStart.Y.Scale,ppStart.Y.Offset+d.Y)
+        end
+    end))
     local busy=false
     local function setHidden(v)
         if busy or U.hidden==v then return end; busy=true
         if v then
-            U.anim(scale,.16,{Scale=.96})
-            task.delay(.19,function() win.Visible=false; shadow.Visible=false; U.hidden=true; pill.Visible=true; busy=false end)
+            U.anim(scale,.16,{Scale=.94})
+            task.delay(.17,function() win.Visible=false; shadow.Visible=false; U.hidden=true; pill.Visible=true; pillScale.Scale=.88; U.anim(pillScale,.22,{Scale=1},Enum.EasingStyle.Back,Enum.EasingDirection.Out); busy=false end)
         else
-            U.hidden=false; pill.Visible=false; win.Visible=true; shadow.Visible=true; scale.Scale=.96
-            U.anim(scale,.22,{Scale=1}); U.runPage(U.activePage); task.delay(.23,function() busy=false end)
+            U.hidden=false; pill.Visible=false; win.Visible=true; shadow.Visible=true; scale.Scale=.94
+            U.anim(scale,.24,{Scale=1},Enum.EasingStyle.Back,Enum.EasingDirection.Out); U.runPage(U.activePage); task.delay(.25,function() busy=false end)
         end
     end
     table.insert(RAVYN._connections,hideB.Activated:Connect(function() setHidden(true) end))
-    table.insert(RAVYN._connections,pill.Activated:Connect(function() setHidden(false) end))
+    table.insert(RAVYN._connections,prestore.Activated:Connect(function() setHidden(false) end))
     table.insert(RAVYN._connections,closeB.Activated:Connect(function() RAVYN:Destroy() end))
     table.insert(RAVYN._connections,UIS.InputBegan:Connect(function(i,gp) if not gp and i.KeyCode==Enum.KeyCode.RightControl then setHidden(not U.hidden) end end))
     local drag,dStart,wStart=false,nil,nil
@@ -9316,7 +15322,11 @@ local function mount()
             local ok,S=pcall(U.buildState)
             if ok and S then
                 U.S=S
-                pdot.BackgroundColor3=S.globalColor
+                U.setColor(pdot,"BackgroundColor3",S.globalColor)
+                U.setText(pstatL,S.global); U.setColor(pstatL,"TextColor3",S.globalColor)
+                local Dx=RAVYN.Direct; local ob=Dx and Dx.objective
+                local act=(ob and ob.name and (ob.name..(ob.progress and string.format(" · %d/%d",ob.progress,ob.required or 0) or ""))) or (S.quest and S.quest.target and S.quest.target~="" and S.quest.target) or S.plain or "—"
+                U.setText(pactL,act)
                 if not U.hidden then
                     U.runGlobal(S); U.runPage(U.activePage)
                 end
@@ -9348,7 +15358,7 @@ end
 env.RAVYN=RAVYN
 pcall(function() RAVYN:LoadSettings() end)
 RAVYN.Registry:refresh()
-print("RAVYN V3.8.5 GAME KNOWLEDGE | LEARN ACTION PROBES | EVIDENCE-FIRST QUESTS | v3.8.4.3 STABILITY")
+print("RAVYN DIRECT v1.2.2 | SILENT COMBAT BUS | INSTAKILL HARDENING | DIRECT CROW | BOSS FARM | BOSS LOOT V2 | PREMIUM MOTION UI")
 mountUI()
 CTX["env"]=env
 CTX["previous"]=previous
@@ -9358,9 +15368,9 @@ if not CTX.RAVYN._gui then
     local detail="UI_NOT_MOUNTED"
     local entries=CTX.RAVYN.Logger and CTX.RAVYN.Logger.entries
     if entries and #entries>0 then detail=detail.." · "..tostring(entries[#entries].message or "") end
-    diag("RAVYN v3.8.5 BOOT PASS · "..detail,true)
+    diag("RAVYN DIRECT v1 BOOT PASS · "..detail,true)
     return CTX.RAVYN
 end
-diag("RAVYN v3.8.5 READY · GAME KNOWLEDGE",false)
+diag("RAVYN DIRECT v1.2.2 READY · SILENT COMBAT · INSTAKILL HARDENING",false)
 task.delay(5,function() if diagGui then pcall(function() diagGui:Destroy() end) end end)
 return CTX.RAVYN
